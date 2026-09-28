@@ -379,12 +379,6 @@ the skill text names exist.
 - **Lane order.** The twelve Claude Code hook lanes of one event arrive in
   the transcript in arrival order, so a rule split across shards can read out
   of sequence. The shard labels let the model reassemble it.
-- **Live checks pending on Codex.** That the review skills run end to end
-  from an installed plugin and that their `allowed-tools` frontmatter is
-  tolerated. Both skills are listed to the model, and the hooks load once
-  the package has no portable root manifest (see Layout). On Claude Code,
-  every case has been checked from a plugin install, the twelve lanes
-  included.
 
 ## License
 

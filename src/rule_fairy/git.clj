@@ -91,6 +91,17 @@
      :real (when (.startsWith real checkout)
              (slashed (.relativize real-root real)))}))
 
+(defn- finished
+  "Runs command, a vector of program and arguments, in dir with extra
+  babashka.process options and returns the finished process: :exit, and
+  :out and :err as strings. p/process rather than p/shell on purpose:
+  shell registers a hook that kills the subprocess tree when the child
+  ends, which enumerates processes through a system call Codex's sandbox
+  forbids, printing a stack trace on every run, and a finished git process
+  leaves nothing to kill."
+  [dir command options]
+  @(apply p/process (merge {:dir dir :out :string :err :string} options) command))
+
 (defn run
   "Runs command, a vector of program and arguments, in dir and returns its
   stdout. options: :ok-exits, the exit codes that count as success (default
@@ -98,10 +109,8 @@
   Any other exit fails with the command's stderr."
   ([dir command] (run dir command {}))
   ([dir command {:keys [ok-exits env in] :or {ok-exits #{0}}}]
-   (let [{:keys [exit out err]} (apply p/shell (cond-> {:dir dir :out :string :err :string :continue true
-                                                        :extra-env (or env {})}
-                                                 in (assoc :in in))
-                                       command)]
+   (let [{:keys [exit out err]} (finished dir command (cond-> {:extra-env (or env {})}
+                                                        in (assoc :in in)))]
      (when-not (ok-exits exit)
        (throw (ex-info (str (str/join " " command) " failed (exit " exit "): " (str/trim err))
                        {:command command :exit exit})))
@@ -117,7 +126,7 @@
 (defn try-git
   "Like git, but nil when the command fails, such as outside a repository."
   [root & args]
-  (let [{:keys [exit out]} (apply p/shell {:dir root :out :string :err :string :continue true} "git" args)]
+  (let [{:keys [exit out]} (finished root (into ["git"] args) {})]
     (when (zero? exit)
       (str/trim out))))
 
