@@ -128,8 +128,9 @@ request also needs the GitHub CLI (`gh`), logged in.
   marketplace for both harnesses.
 - `hooks/hooks.json`, `hooks/codex-hooks.json`: hook registrations. Every
   command runs `hooks/run`, a small shell wrapper that finds the plugin root,
-  makes sure `bb` is on the PATH, and starts Babashka with the plugin's own
-  `bb.edn` so a consuming repository's `bb.edn` never reaches the classpath.
+  hands it to the script as `RULE_FAIRY_PLUGIN_ROOT`, makes sure `bb` is on
+  the PATH, and starts Babashka with the plugin's own `bb.edn` so a consuming
+  repository's `bb.edn` never reaches the classpath.
 - `hooks/claude/`: `common.bb` (project root, session state, lane batching,
   the glob cache, shell-change detection), `prompt.bb`, `edit.bb`,
   `shell.bb`, and `common_test.bb`.
@@ -245,12 +246,48 @@ The hooks write session state and glob caches under `.rule-fairy/claude/` and
 `.rule-fairy/codex/` in the project, and review bundles go under
 `.rule-fairy/review/<mode>/`. Each of those directories carries a `.gitignore`
 ignoring its own content, so nothing needs to be added to the repository's
-ignore rules. The Claude registration sets `RULE_FAIRY_LANE` per hook entry.
+ignore rules. The hooks also record the directory the plugin runs from in
+`.rule-fairy/<harness>/plugin-root`, one absolute path on one line, for a
+skill of the project that wants the plugin's review scripts (see Using the
+review from another skill). The Claude registration sets `RULE_FAIRY_LANE`
+per hook entry.
 
 Context injected by the hooks is labelled `[rule-fairy injected: <rule>]`,
 `[rule-fairy matched: alwaysApply ...]`, `[rule-fairy matched: keyword ...]`,
 `[rule-fairy matched: glob on <path>]`, `[rule-fairy shard n/m]`, and
 `[rule-fairy error: ...]`.
+
+## Using the review from another skill
+
+A project's own review skill can run the rules pass with the plugin's
+scripts instead of collecting rules itself. The hooks record where the
+plugin runs from in `.rule-fairy/<harness>/plugin-root` (`claude` or
+`codex`), one absolute path, written on the first prompt of a session. Read
+it; a missing file, or one naming a directory that no longer exists, is a
+setup error to report, not a reason to look for the plugin elsewhere. Under
+that root, `skills/review/scripts/run` is the launcher and
+`skills/review/references/procedure.md` the procedure. From the project
+root:
+
+```sh
+"<root>/skills/review/scripts/run" fetch --base main   # or --local, or --pr <n> [--checkout]
+"<root>/skills/review/scripts/run" bundle
+"<root>/skills/review/scripts/run" clean                # once every pass has read the artifacts
+```
+
+`fetch` writes `.rule-fairy/review/diff/patch.diff` and `meta.json` (the
+code revision, the mode and, under `rules`, the rules revision); `bundle`
+writes `rules.md` beside them and completes `rules`. A failed command exits
+non-zero and leaves no new artifact: report it as a coverage failure rather
+than reuse an older bundle. The commands invoke no skill, post nothing and
+touch no file of the caller's, with one exception: `--checkout` checks the
+pull request out detached and needs the user's explicit authorisation, as
+the review skill says. `clean` removes only that directory, when the caller
+says so. To review, hand a reader the three files and the procedure
+as absolute paths: in Claude Code the `rule-fairy:rules-reviewer` agent with
+the prompt from the review skill, elsewhere a subagent that follows the
+procedure. It returns findings and coverage to its caller, which builds the
+report.
 
 ## Checks
 
@@ -320,6 +357,15 @@ the skill text names exist.
 - State files and the glob cache are replaced atomically through a temporary
   file, so a session reading while another writes sees whole content, and a
   hook killed mid-write leaves the old file in place.
+- The hooks record where the plugin runs from, in `plugin-root` under the
+  harness's state directory, on every run that touches session state, so
+  the first prompt of a session writes it. A skill of the consuming project
+  reaches the plugin's review scripts and procedure through that file, the
+  last root a hook ran from, rather than through the harnesses' plugin
+  registries, which differ in shape and in what they point at. A missing
+  file, or one naming a directory that no longer exists, is a setup failure
+  for that skill to report, never a reason to use another checkout or to
+  download code.
 - A review's `rules.clean` says whether the guidance the bundle used is what
   is committed. It covers every piece of that guidance, the rules
   directories and their files, `rule-fairy.edn`, the instruction files and

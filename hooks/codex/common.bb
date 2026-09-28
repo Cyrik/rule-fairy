@@ -41,6 +41,11 @@
 (def rules-source (rules/project-rules-source project-root))
 (def state-dir (str (io/file project-root ".rule-fairy/codex")))
 (def cache-file (str (io/file state-dir "globs-cache.edn")))
+;; Forced with the first session-state access of the process: the first
+;; prompt of a session records where the plugin runs from, and a hook that
+;; exits before touching state records nothing. hooks/run exports the root.
+(def ^:private plugin-root-recorded
+  (delay (session-state/record-plugin-root! state-dir (System/getenv "RULE_FAIRY_PLUGIN_ROOT"))))
 (def reinjection-threshold-bytes session-state/reinjection-threshold-bytes)
 (def ^:private compaction-pattern #"\"type\":\"compacted\"")
 
@@ -66,6 +71,7 @@
   parent's session id, so a hook reads the state, decides and saves inside
   one call; the helpers below expect to run under it."
   [session-id f]
+  @plugin-root-recorded
   (session-state/with-lock state-dir session-id f))
 
 (defn transcript-metrics!

@@ -2,13 +2,17 @@
 
 How to check a change against a repository's explicit rules once the inputs
 exist. The `rule-fairy:review` skill prepares them for a diff; the
-`rule-fairy:review-plan` skill prepares them for a plan. The reviewer that
-follows this procedure reads, compares and reports. It never edits files,
-changes the checkout, commits, or posts anywhere.
+`rule-fairy:review-plan` skill prepares them for a plan; a review skill of
+the project itself can prepare them with the same commands and follow this
+procedure for its rules pass (see the README). The reviewer that follows
+this procedure reads, compares and reports. It never edits files, changes
+the checkout, commits, or posts anywhere.
 
 ## Inputs
 
-Three files, all under the reviewed project's `.rule-fairy/review/<mode>/`:
+Three files, which the prompt names as absolute paths; the plugin's `review
+fetch`, `review bundle` and `review-plan bundle` commands write them under
+the reviewed project's `.rule-fairy/review/<mode>/`:
 
 - `patch.diff` (diff review) or the plan file named in the prompt (plan
   review): the change under review.
@@ -88,7 +92,9 @@ reviewed and whether they match, whether the full bundle was read, and any
 rule that could not be checked and why. Say "no rule violations found" only
 for the scope actually checked.
 
-Return the report to the user. Do not fix code, change the checkout, commit,
+Return the report to the caller: the user when the procedure was invoked
+directly, otherwise the skill or agent that invoked it, which relays it or
+folds it into a larger review. Do not fix code, change the checkout, commit,
 or post a review. When asked to write a report file, choose a new path rather
 than overwrite an existing one.
 

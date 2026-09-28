@@ -790,5 +790,14 @@
         (is (str/includes? rendered "Name each testing block by its phase."))
         (is (not (str/includes? rendered "not imported")))))))
 
+(deftest plugin-root-recorded-test
+  (with-temp-project
+    {".cursor/rules/base.mdc" "---\nalwaysApply: true\n---\n# Base\n"}
+    (fn [root]
+      (run-prompt-hook root "session" "hello")
+      (is (= (str repository-directory "\n")
+             (slurp (io/file root ".rule-fairy/claude/plugin-root")))
+          "the first prompt records the plugin root the launcher resolved, on one line"))))
+
 (let [{:keys [fail error]} (run-tests 'rule-common-test)]
   (System/exit (+ fail error)))

@@ -4,16 +4,20 @@
 # Usage: run <script path relative to hooks/>
 #
 # The plugin root comes from the harness (CLAUDE_PLUGIN_ROOT for Claude Code,
-# PLUGIN_ROOT for Codex) or from this file's location. Passing the plugin's
-# bb.edn with --config keeps a consuming repository's own bb.edn, and any
-# dependencies it declares, out of the hook's classpath. Agents launched from
-# an editor or app can inherit a PATH without bb; the usual install locations
-# are added when that happens.
+# PLUGIN_ROOT for Codex) or from this file's location, and is handed to the
+# script as RULE_FAIRY_PLUGIN_ROOT, which the hooks record in the project for
+# its own skills to find the plugin. Passing the plugin's bb.edn with --config
+# keeps a consuming repository's own bb.edn, and any dependencies it declares,
+# out of the hook's classpath. Agents launched from an editor or app can
+# inherit a PATH without bb; the usual install locations are added when that
+# happens.
 set -eu
 root="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}"
 if [ -z "$root" ]; then
   root="$(cd "$(dirname "$0")/.." && pwd)"
 fi
+RULE_FAIRY_PLUGIN_ROOT="$root"
+export RULE_FAIRY_PLUGIN_ROOT
 if ! command -v bb >/dev/null 2>&1; then
   PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
   export PATH

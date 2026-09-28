@@ -71,6 +71,28 @@
           (is (= "{:a 2}" (slurp file)))
           (is (= ["s.edn"] (map #(.getName %) (.listFiles (io/file state-dir))))))))))
 
+(deftest record-plugin-root-test
+  (with-temp-dir
+    (fn [state-dir]
+      (let [file (io/file state-dir "plugin-root")
+            whole-second (* 1000 (quot (- (System/currentTimeMillis) 60000) 1000))]
+        (testing "a nil root, a script run outside the launcher, records nothing"
+          (session-state/record-plugin-root! state-dir nil)
+          (is (not (.exists file))))
+        (testing "the root is one line in a self-ignoring directory"
+          (session-state/record-plugin-root! state-dir "/plugins/rule-fairy/0.1.0")
+          (is (= "/plugins/rule-fairy/0.1.0\n" (slurp file)))
+          (is (= "*\n" (slurp (io/file state-dir ".gitignore")))))
+        (testing "an unchanged root leaves the file untouched"
+          (.setLastModified file whole-second)
+          (session-state/record-plugin-root! state-dir "/plugins/rule-fairy/0.1.0")
+          (is (= whole-second (.lastModified file))))
+        (testing "a new root replaces the file, leaving no temporary file behind"
+          (session-state/record-plugin-root! state-dir "/plugins/rule-fairy/0.2.0")
+          (is (= "/plugins/rule-fairy/0.2.0\n" (slurp file)))
+          (is (= [".gitignore" "plugin-root"]
+                 (sort (map #(.getName %) (.listFiles (io/file state-dir)))))))))))
+
 (deftest with-lock-test
   (with-temp-dir
     (fn [state-dir]

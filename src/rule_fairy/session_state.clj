@@ -74,6 +74,22 @@
                 (into-array CopyOption [StandardCopyOption/ATOMIC_MOVE
                                         StandardCopyOption/REPLACE_EXISTING]))))
 
+(defn record-plugin-root!
+  "Records root, the directory the installed plugin runs from, as one line
+  in `plugin-root` in the state directory, so a skill of the consuming
+  project can reach the plugin's review scripts and procedure without
+  knowing where its harness keeps plugins. Written atomically and only when
+  the content differs, since the hooks call this on every run that touches
+  session state; a nil root, a hook script run outside the plugin's
+  launcher, records nothing."
+  [state-dir root]
+  (when root
+    (let [file (io/file state-dir "plugin-root")
+          content (str root "\n")]
+      (when-not (and (.isFile file) (= content (slurp file)))
+        (ensure-dir! state-dir)
+        (replace-file! file content)))))
+
 (defn state-file [state-dir session-id]
   (io/file state-dir (str session-id ".edn")))
 

@@ -21,6 +21,11 @@
 
 (def rules-source (rules/project-rules-source project-root))
 (def state-dir (str (io/file project-root ".rule-fairy/claude")))
+;; Forced with the first session-state access of the process: the first
+;; prompt of a session records where the plugin runs from, and a hook that
+;; exits before touching state records nothing. hooks/run exports the root.
+(def ^:private plugin-root-recorded
+  (delay (session-state/record-plugin-root! state-dir (System/getenv "RULE_FAIRY_PLUGIN_ROOT"))))
 ;; Transcripts live under Claude Code's configuration directory, which
 ;; CLAUDE_CONFIG_DIR relocates as a whole.
 (def claude-projects-dir
@@ -100,6 +105,7 @@
   (str state-dir "/batches/" session-id "/" event-id ".edn"))
 
 (defn- with-session-lock [session-id f]
+  @plugin-root-recorded
   (session-state/with-lock state-dir session-id f))
 
 ;;; Files written through the shell
