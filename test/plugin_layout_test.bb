@@ -65,19 +65,16 @@
 
 (deftest manifests-test
   (let [manifest #(json/parse-string (slurp (io/file plugin-root %)) true)
-        portable (manifest "plugin.json")
         claude (manifest ".claude-plugin/plugin.json")
         codex (manifest ".codex-plugin/plugin.json")
         marketplace (manifest ".claude-plugin/marketplace.json")]
-    (testing "the three manifests and the marketplace entry agree on name and version"
-      (is (= #{"rule-fairy"} (set (map :name [portable claude codex]))))
-      (is (= 1 (count (distinct (map :version [portable claude codex])))))
-      (is (= [(:version portable)] (mapv :version (:plugins marketplace))))
+    (testing "both manifests and the marketplace entry agree on name and version"
+      (is (= #{"rule-fairy"} (set (map :name [claude codex]))))
+      (is (= 1 (count (distinct (map :version [claude codex])))))
+      (is (= [(:version codex)] (mapv :version (:plugins marketplace))))
       (is (= "rule-fairy" (:name (first (:plugins marketplace))))))
-    (testing "the root manifest is a portable Agent Plugins manifest, so Codex discovers skills/ itself"
-      (is (= "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json" (:$schema portable)))
-      (is (nil? (:hooks portable)) "hooks belong to the Codex overlay")
-      (is (nil? (:extensions portable)) "an extensions.com.openai block would replace the overlay"))
+    (testing "no portable root manifest: Codex CLI 0.154.0 loads no hooks from a package that has one, whatever the overlay says"
+      (is (not (.exists (io/file plugin-root "plugin.json")))))
     (testing "the Codex overlay points at an existing hooks file"
       (is (.isFile (io/file plugin-root (:hooks codex))) (:hooks codex))))
   (testing "the procedure file both skills reference exists"

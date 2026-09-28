@@ -117,12 +117,15 @@ request also needs the GitHub CLI (`gh`), logged in.
 
 ## Layout
 
-- `plugin.json`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`:
-  the manifests. The root file is the portable Agent Plugins manifest Codex
-  reads, which makes it discover `skills/` on its own; `.codex-plugin/` is
-  Codex's overlay carrying the hooks registration and the listing interface;
-  `.claude-plugin/` is Claude Code's manifest. `.claude-plugin/marketplace.json`
-  makes the repository its own marketplace for both harnesses.
+- `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`: the manifests.
+  `.claude-plugin/` is Claude Code's; `.codex-plugin/` is Codex's, carrying
+  the hooks registration and the listing interface, with `skills/`
+  discovered by convention. There is deliberately no portable root
+  `plugin.json`: Codex CLI 0.154.0 loads no hooks at all from a package that
+  has one, whether they are declared in the overlay, in the root file or in
+  its `extensions.com.openai` block, although its docs say the overlay
+  applies. `.claude-plugin/marketplace.json` makes the repository its own
+  marketplace for both harnesses.
 - `hooks/hooks.json`, `hooks/codex-hooks.json`: hook registrations. Every
   command runs `hooks/run`, a small shell wrapper that finds the plugin root,
   makes sure `bb` is on the PATH, and starts Babashka with the plugin's own
@@ -376,10 +379,12 @@ the skill text names exist.
 - **Lane order.** The twelve Claude Code hook lanes of one event arrive in
   the transcript in arrival order, so a rule split across shards can read out
   of sequence. The shard labels let the model reassemble it.
-- **Live checks pending on Codex.** That the overlay's hook registration
-  applies alongside the portable root manifest, that both skills appear, and
-  that the skills' `allowed-tools` frontmatter is tolerated. On Claude Code,
-  that all twelve lanes fire from a plugin install.
+- **Live checks pending on Codex.** That the review skills run end to end
+  from an installed plugin and that their `allowed-tools` frontmatter is
+  tolerated. Both skills are listed to the model, and the hooks load once
+  the package has no portable root manifest (see Layout). On Claude Code,
+  every case has been checked from a plugin install, the twelve lanes
+  included.
 
 ## License
 
