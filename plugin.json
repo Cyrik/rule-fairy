@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "rule-fairy",
+  "version": "0.1.0",
+  "description": "Repository rules and docs, delivered to your coding agent. Injects Cursor-style rules by prompt keyword, edited path, or alwaysApply, with documentation imports and reinjection after compaction, and reviews diffs and plans against the rules that apply to them.",
+  "author": {
+    "name": "Lukas Domagala"
+  },
+  "repository": "https://github.com/Cyrik/rule-fairy",
+  "license": "MIT",
+  "keywords": ["rules", "cursor", "hooks", "context", "review", "claude-code", "codex"]
+}

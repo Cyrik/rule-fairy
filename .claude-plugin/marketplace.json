@@ -1,0 +1,17 @@
+{
+  "name": "rule-fairy",
+  "owner": {
+    "name": "Lukas Domagala"
+  },
+  "metadata": {
+    "description": "Rule Fairy: repository rules and docs, delivered to your coding agent."
+  },
+  "plugins": [
+    {
+      "name": "rule-fairy",
+      "version": "0.1.0",
+      "source": "./",
+      "description": "Injects Cursor-style rules into Claude Code and Codex by prompt keyword, edited path, or alwaysApply."
+    }
+  ]
+}

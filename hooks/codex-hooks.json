@@ -1,0 +1,21 @@
+{
+  "hooks" : {
+    "UserPromptSubmit" : [ {
+      "hooks" : [ {
+        "type" : "command",
+        "command" : "\"${PLUGIN_ROOT}/hooks/run\" codex/prompt.bb",
+        "statusMessage" : "Checking prompt rules",
+        "additionalContextLimit" : 0
+      } ]
+    } ],
+    "PostToolUse" : [ {
+      "matcher" : "^(Bash|apply_patch|Edit|Write)$|mcp__.*(edit|write|patch)",
+      "hooks" : [ {
+        "type" : "command",
+        "command" : "\"${PLUGIN_ROOT}/hooks/run\" codex/post_edit.bb",
+        "statusMessage" : "Checking edited-file rules",
+        "additionalContextLimit" : 0
+      } ]
+    } ]
+  }
+}

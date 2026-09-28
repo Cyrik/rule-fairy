@@ -1,0 +1,18 @@
+#!/bin/sh
+# Runs this skill's Babashka script with the plugin's own configuration.
+#
+# Usage: run <subcommand> [args...]
+#
+# The plugin root is three directories up from this file. Passing the plugin's
+# bb.edn with --config keeps the reviewed repository's own bb.edn, and any
+# dependencies it declares, off the classpath. Agents launched from an editor
+# or app can inherit a PATH without bb; the usual install locations are added
+# when that happens.
+set -eu
+here="$(cd "$(dirname "$0")" && pwd)"
+root="$(cd "$here/../../.." && pwd)"
+if ! command -v bb >/dev/null 2>&1; then
+  PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+  export PATH
+fi
+exec bb --config "$root/bb.edn" "$here/review.bb" "$@"

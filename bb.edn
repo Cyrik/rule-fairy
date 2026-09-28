@@ -1,0 +1,25 @@
+{:paths ["src"]
+ :tasks
+ {:requires ([babashka.process :as p])
+  test {:doc "Run every suite: engine, Markdown, instruction files, dedup, bundle, git, plan, transcript, session state, Claude hooks, Codex hooks, review and review-plan skill scripts, plugin layout."
+        :task (let [suites ["test/rules_test.bb"
+                            "test/markdown_test.bb"
+                            "test/instructions_test.bb"
+                            "test/dedup_test.bb"
+                            "test/bundle_test.bb"
+                            "test/git_test.bb"
+                            "test/plan_test.bb"
+                            "test/transcript_test.bb"
+                            "test/session_state_test.bb"
+                            "test/changes_test.bb"
+                            "hooks/claude/common_test.bb"
+                            "hooks/codex/common_test.bb"
+                            "skills/review/scripts/review_test.bb"
+                            "skills/review-plan/scripts/review_plan_test.bb"
+                            "test/plugin_layout_test.bb"]
+                    failed (vec (filter (fn [suite]
+                                          (pos? (:exit (p/shell {:continue true} "bb" suite))))
+                                        suites))]
+                (when (seq failed)
+                  (println "Failed suites:" (pr-str failed))
+                  (System/exit (count failed))))}}}

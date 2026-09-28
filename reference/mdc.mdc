@@ -1,0 +1,303 @@
+---
+description: MDC files: Format and structure guidelines for creating MDC rule files
+promptAnyOf: mdc, mdcs, mdc file, cursor rule, promptAnyOf, promptRequires, agent-context, mdc frontmatter
+globs: **/*.mdc
+alwaysApply: false
+---
+# MDC File Format Guide
+
+MDC (Markdown Configuration) files are used by Cursor to provide context-specific instructions to AI assistants. This guide explains how to create and maintain these files properly.
+
+## Quick Start
+
+To create a new MDC rule file:
+
+1. Create a file in `.cursor/rules/` with a descriptive name ending in `.mdc`
+2. Add frontmatter with `description` and `globs` fields
+3. Add `promptAnyOf` and optional `promptRequires` when hooks must select the rule from prompt text
+4. Write your guidelines in Markdown below the frontmatter
+
+Rule Fairy reads `.cursor/rules/**/*.mdc` by default; a `rule-fairy.edn` at the project root with
+`{:rules {:dirs [...] :extensions [...]}}` adds or moves directories and extensions.
+
+Example:
+```markdown
+---
+description: Your topic: Brief description of what this rule covers
+promptAnyOf: topic keyword, related function
+promptRequires: broader context
+globs: path/to/**/*.clj
+alwaysApply: false
+---
+
+# Your Rule Title
+
+Your guidelines here...
+```
+
+## Writing Style
+
+MDC files are consumed by AI, not humans. Write accordingly:
+
+- **Terse over verbose** — state the pattern, skip the rationale
+- **Examples over explanations** — show, don't tell
+- **Triggers over context** — when does this apply?
+- **Wrap prose around 200 chars** — long unbroken lines hurt diff review and editor scrolling. Hard-wrap paragraphs; let code blocks be as long as they need.
+
+## File Structure
+
+Each MDC file consists of two main parts:
+
+1. **Frontmatter** - Configuration metadata at the top of the file
+2. **Markdown Content** - The actual instructions in Markdown format
+
+### Frontmatter
+
+The frontmatter must be the first thing in the file and must be enclosed between triple-dash lines (`---`). Configuration should be based on the intended behavior:
+
+```
+---
+description: Brief description of what the rule does
+promptAnyOf: topic keyword, related function
+promptRequires: broader context
+globs: **/*.js, **/*.ts
+alwaysApply: false
+---
+```
+
+**Note**: Comments in frontmatter are not standard. Keep frontmatter simple and clear.
+
+> **Important**: Despite the appearance, the frontmatter is not strictly YAML formatted. The `globs` field is a comma-separated list and should NOT include brackets `[]` or quotes `"`.
+
+#### Guidelines for Setting Fields
+
+- **description**: Should be agent-friendly and clearly describe when the rule is relevant. Format as `<topic>: <details>` for best results.
+- **promptAnyOf**: Optional, comma-separated prompt terms. At least one term must match for Codex and Claude hooks to inject the rule.
+- **promptRequires**: Optional, comma-separated prompt terms. Every term must match in addition to `promptAnyOf`.
+  These fields are repository hook extensions; Cursor does not use them to select rules.
+- **globs**: 
+  - If a rule is only relevant in very specific situations, leave globs empty (omit the field entirely) so it's loaded only when applicable to the user request.
+  
+  Example with empty globs:
+  ```
+  ---
+  description: Special case: Handle legacy API endpoints
+  alwaysApply: false
+  ---
+  ```
+  
+  - If the only glob would match all files (like `**/*`), leave it empty and set `alwaysApply: true` instead.
+  - Otherwise, be as specific as possible with glob patterns to ensure rules are only applied with relevant files.
+- **alwaysApply**: Use sparingly for truly global guidelines that apply regardless of file context.
+
+  **When to use `alwaysApply: true`:**
+  - Rules that apply to all code regardless of file type or location
+  - Universal coding standards or architectural principles
+  - Rules that don't have a specific file pattern
+  
+  **When NOT to use:**
+  - Rules specific to certain file types (use globs instead)
+  - Rules that only apply in certain directories (use globs instead)
+  - Rules that might not be relevant to all work
+  
+  **Performance note:** Rules with `alwaysApply: true` are always loaded, which can increase context size. Use globs when possible.
+
+  **Hook delivery:** The Codex and Claude prompt hooks inject always-on rules with the first prompt of a session and again
+  after compaction, labelled `[mdc-hook: alwaysApply ...]`. Keep such content out of `CLAUDE.md` and `AGENTS.md` so it is
+  not delivered twice.
+
+#### Description Examples
+
+**Bad examples:**
+- `description: Rules for UI` - Too vague, doesn't help AI understand when to apply
+- `description: UI components` - Missing context about what the rule covers
+
+**Good examples:**
+- `description: UI development patterns: component structure, styling, HTMX/Alpine.js usage` - Clear topic and details
+- `description: MDC files: Format and structure guidelines for creating MDC rule files` - Specific and actionable
+
+#### Glob Pattern Examples
+
+- `**/*.js` - All JavaScript files
+- `src/**/*.jsx` - All JSX files in the src directory
+- `**/components/**/*.vue` - All Vue files in any components directory
+- `apps/**/ui/**/*.clj` - All Clojure files in UI directories within apps
+
+### Markdown Content
+
+After the frontmatter, the rest of the file should be valid Markdown:
+
+```markdown
+# Title of Your Rule
+
+## Section 1
+- Guidelines and information
+- Code examples
+
+## Section 2
+More detailed information...
+```
+
+#### File References
+
+Use Markdown links for optional navigation and `@` directives for context that agents need to perform the task.
+
+**1. Reference other MDC files** using markdown link syntax:
+```markdown
+[other_rule.mdc](mdc:.cursor/rules/other_rule.mdc)
+```
+
+**2. Include a whole file** with `@filename`:
+```markdown
+@doc/architecture.md
+@doc/guides/development.md
+@.cursor/rules/other_rule.mdc
+```
+
+**3. Include one Markdown section** with its heading fragment:
+```markdown
+@doc/conventions/ui_conventions.md#component-reuse
+```
+
+The section starts at the selected heading and ends before the next heading of the same or a higher level. Child headings are included.
+When multiple active MDCs select overlapping sections, the hooks merge the ranges and inject the content once.
+
+Paths are relative to the workspace root and must stay inside it. Import directives inside fenced code blocks remain example text.
+
+Use omission markers when part of an imported document does not help an agent perform the task:
+```markdown
+<!-- agent-context: omit -->
+Historical rationale or long human-facing examples.
+<!-- /agent-context -->
+```
+
+Omissions cannot nest. The hook validates markers across the whole source document and removes omitted blocks after it selects the requested section.
+
+**Guidelines:**
+- Only reference files that exist in the workspace - verify file paths before adding references
+- Use imports to avoid duplicating content across rule files and canonical documentation
+- Keep the total selected documentation within the hook's 64 KiB safety budget
+- Prefer referencing focused, single-topic files over large, general ones
+- Prefer heading imports when an MDC needs only part of a Markdown file
+
+#### Code Blocks
+
+Use fenced code blocks for examples with language specification:
+
+````markdown
+```clojure
+(defn example []
+  "Example code")
+```
+````
+
+Always specify the language for proper syntax highlighting and context.
+
+**Qualify function names in examples:** When documenting functions from dev namespaces (like `user`), always use the fully qualified form (e.g., `(user/start-server ...)` not `(start-server ...)`). Agents execute examples literally, and unqualified names fail unless already in that namespace.
+
+## Best Practices
+
+- Task-specific rules go in `tasks/` subdirectory
+- Target <300 lines; split larger rules into multiple files
+- Test with explicit `@rule-name.mdc` reference
+
+## Common Patterns
+
+### Domain-Specific Rules
+Create rules for specific domains (UI, API, domain logic):
+- Use specific glob patterns: `apps/**/ui/**/*.clj` for UI rules
+- Group related patterns together
+- Reference shared components or utilities
+
+### Task-Specific Rules
+For one-off tasks or temporary guidelines:
+- Place in `.cursor/rules/tasks/` subdirectory
+- Use descriptive names: `task-0001-feature-name.mdc`
+- Consider removing after task completion
+
+### Nested Rules
+You can organize rules by placing `.cursor/rules` directories in subdirectories throughout your project. Nested rules automatically attach when files in their directory are referenced.
+
+Example structure (generic example):
+```
+project/
+  .cursor/rules/           # Project-wide rules
+  backend/
+    server/
+      .cursor/rules/       # Backend-specific rules
+  frontend/
+    .cursor/rules/         # Frontend-specific rules
+```
+
+**Note:** This example uses generic directory names. Nest rule directories to match the repository layout.
+
+Rules from nested directories are combined with parent directories, with more specific rules taking precedence.
+
+### Cross-Cutting Concerns
+For patterns that span multiple domains:
+- Use broader but still specific globs
+- Document which domains are affected
+- Consider splitting if the rule becomes too large
+
+## Rule Types
+
+Based on frontmatter configuration:
+
+| Type | Config | When Applied |
+|------|--------|--------------|
+| Always | `alwaysApply: true` | Every chat session |
+| Intelligent | empty `globs`, has `description` | Agent decides based on description |
+| File-specific | `globs` pattern | Files match the pattern |
+| Manual | any rule | Explicitly referenced with `@rule-name.mdc` |
+
+**Note:** Rules only apply to Agent (Chat), not to Cursor Tab or Inline Edit.
+
+## Maintaining Rules
+
+- **Creating**: Add `promptAnyOf` and optional `promptRequires` to the rule frontmatter if keyword-based injection is wanted
+- **Updating**: Update any project guidance references if scope changed
+- **Renaming/removing**: Update references in other MDC files
+
+## Common Mistakes
+
+- **Missing frontmatter**: Starting directly with content instead of including frontmatter at the top. Frontmatter is required for Cursor to properly parse the file.
+
+- **Incorrect globs format**: Using array syntax `["**/*.js"]` or quoted strings. Use comma-separated values: `**/*.js, **/*.ts`
+
+- **Missing prompt alternatives**: `promptRequires` has no effect without `promptAnyOf`. Prompt injection always needs at least one alternative match.
+
+- **Cursor rewrites extension fields**: Cursor ignores `promptAnyOf` and `promptRequires` when it reads a rule, but its rule-type controls can
+  rewrite frontmatter using only native fields. After changing a rule type in the UI, verify that the prompt fields remain.
+
+- **Referencing non-existent files**: Including file references in descriptions or content that don't exist in the workspace. Always verify file existence before referencing.
+
+- **Inconsistent structure**: Mixing heading levels or lacking clear hierarchical organization. Use consistent H1 → H2 → H3 structure.
+
+- **Vague descriptions**: Using generic descriptions that don't help the AI understand when to apply the rule. Use the `<topic>: <details>` format.
+
+- **Overly broad globs**: Using patterns that match too many files (like `**/*.clj` for a UI-specific rule). Be as specific as possible.
+
+- **Rule not applying**: Check glob pattern matches, description is specific, frontmatter has no syntax errors, file is in `.cursor/rules/`
+
+- **File references broken**: Paths are relative to workspace root, use forward slashes, no circular references
+
+## Validation Checklist
+
+**Required:**
+- Frontmatter present and valid
+- Main title (H1) present
+- At least one content section
+- Glob patterns use comma-separated format (no brackets or quotes)
+- All referenced files exist in the workspace
+
+**Recommended:**
+- Clear, agent-friendly description following `<topic>: <details>` format
+- Specific glob patterns matching only relevant files
+- Prompt triggers live in the rule frontmatter when keyword-based injection is needed
+- Practical code examples with language specified
+- Proper markdown formatting
+- Under 300 lines (good target), maximum 500 lines (official recommendation - split if larger)
+
+## Related Resources
+
+- [Cursor Rules Documentation](https://cursor.com/docs/context/rules) - Official Cursor documentation

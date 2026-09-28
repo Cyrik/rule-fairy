@@ -1,0 +1,11 @@
+/.local/
+/.cpcache/
+/.clj-kondo/.cache/
+/.claude/settings.local.json
+
+# Editors and the OS
+.DS_Store
+/.lsp/
+/.portal/
+/.vscode/
+/.idea/

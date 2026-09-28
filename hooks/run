@@ -1,0 +1,21 @@
+#!/bin/sh
+# Runs one Rule Fairy hook script with the plugin's own Babashka configuration.
+#
+# Usage: run <script path relative to hooks/>
+#
+# The plugin root comes from the harness (CLAUDE_PLUGIN_ROOT for Claude Code,
+# PLUGIN_ROOT for Codex) or from this file's location. Passing the plugin's
+# bb.edn with --config keeps a consuming repository's own bb.edn, and any
+# dependencies it declares, out of the hook's classpath. Agents launched from
+# an editor or app can inherit a PATH without bb; the usual install locations
+# are added when that happens.
+set -eu
+root="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}"
+if [ -z "$root" ]; then
+  root="$(cd "$(dirname "$0")/.." && pwd)"
+fi
+if ! command -v bb >/dev/null 2>&1; then
+  PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+  export PATH
+fi
+exec bb --config "$root/bb.edn" "$root/hooks/$1"
