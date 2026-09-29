@@ -125,7 +125,9 @@ request also needs the GitHub CLI (`gh`), logged in.
   has one, whether they are declared in the overlay, in the root file or in
   its `extensions.com.openai` block, although its docs say the overlay
   applies. `.claude-plugin/marketplace.json` makes the repository its own
-  marketplace for both harnesses.
+  marketplace for both harnesses. The three files carry the same version,
+  bumped with every push meant for installed users, because Claude Code's
+  `plugin update` acts only on a version change.
 - `hooks/hooks.json`, `hooks/codex-hooks.json`: hook registrations. Every
   command runs `hooks/run`, a small shell wrapper that finds the plugin root,
   hands it to the script as `RULE_FAIRY_PLUGIN_ROOT`, makes sure `bb` is on
