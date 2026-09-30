@@ -11,6 +11,9 @@ Rules can import sections of your documentation by heading, and injected rules
 come back after the context is compacted. The same matcher powers a review of
 a diff or a plan against the rules that apply to it.
 
+Clojure/conj 2026 talk: [Just-in-Time Context for Agents](docs/talks/clojure-conj-2026/presentation.md)
+([slides, PDF](docs/talks/clojure-conj-2026/just-in-time-context.pdf)).
+
 ## Why not the harnesses' own rules
 
 Claude Code has `.claude/rules/` with `paths:` globs, Codex has `AGENTS.md`,
