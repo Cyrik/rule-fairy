@@ -310,5 +310,21 @@
         (is (str/includes? rendered "line one"))
         (is (not (str/includes? rendered "not imported")))))))
 
+(deftest import-only-heading-keeps-a-pointer-test
+  (with-temp-project
+    {".cursor/rules/ui.mdc" "# UI\n\n### Dialogs\n\n@doc/guide.md#dialogs\n\n### Next\n\nprose\n"
+     "doc/guide.md" "# Guide\n\n## Dialogs\n\ndialog text\n"}
+    (fn [root]
+      (let [rendered (rules/render-rules (rules/project-rules-source root) ["ui.mdc"])]
+        (testing "a heading whose only content was an import keeps a line naming it"
+          (is (str/includes? rendered
+                             (str "### Dialogs\n\n"
+                                  "Imported: `doc/guide.md#dialogs` (delivered as a Required context block)\n\n"
+                                  "### Next"))))
+        (testing "the import line is gone and the section renders once, in its documentation block"
+          (is (not (str/includes? rendered "@doc/guide.md")))
+          (is (= 1 (count (re-seq #"dialog text" rendered))))
+          (is (str/includes? rendered "## Required context: `doc/guide.md#dialogs` (ui.mdc)\n\n## Dialogs\n\ndialog text")))))))
+
 (let [{:keys [fail error]} (run-tests 'rules-test)]
   (System/exit (+ fail error)))

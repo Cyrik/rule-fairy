@@ -7,7 +7,8 @@
             [rule-fairy.changes :as changes]
             [rule-fairy.git :as git]
             [rule-fairy.rules :as rules]
-            [rule-fairy.session-state :as session-state])
+            [rule-fairy.session-state :as session-state]
+            [rule-fairy.transcript :as transcript])
   (:import [java.math BigInteger]
            [java.security MessageDigest]))
 
@@ -57,6 +58,36 @@
 
 (defn rules-for-prompt [prompt]
   (rules/rules-for-prompt rules-source prompt))
+
+(def shell-prefix-path-budget
+  "Characters the shell hook's matched line spends on naming changed paths:
+  the leading paths that fit are named and the rest are counted. Rules match
+  by glob, so the names inform the agent without deciding anything, and
+  neither a rebase's hundreds of paths nor a few very long ones may push the
+  prefix past the frame limit."
+  1000)
+
+(defn shell-prefix
+  "The first-frame prefix of a shell-change delivery: the injected markers,
+  the matched line naming the leading changed paths that fit the budget and
+  counting the rest, and the post-edit contract."
+  [rule-names paths]
+  (let [named (loop [named [] remaining paths used 0]
+                (if-let [path (first remaining)]
+                  (let [used (+ used (count path) (if (seq named) 2 0))]
+                    (if (<= used shell-prefix-path-budget)
+                      (recur (conj named path) (rest remaining) used)
+                      named))
+                  named))
+        rest-count (- (count paths) (count named))
+        matched (cond
+                  (empty? named) (str (count paths) " paths")
+                  (pos? rest-count) (str (str/join ", " named) " and " rest-count " more")
+                  :else (str/join ", " named))]
+    (str (str/join "\n" (map #(str "[rule-fairy injected: " % "]") rule-names))
+         "\n[rule-fairy matched: glob on " matched ", changed by a shell command]\n\n"
+         "Apply these rules on the next pass over this change. "
+         "If the completed change conflicts with them, revise it before moving on.")))
 
 (defn transcript-file [session-id]
   (some (fn [project-directory]
@@ -195,7 +226,20 @@
           []
           (sort-by count > pieces)))
 
-(defn injection-frames [rule-names prefix]
+(defn delivery-id
+  "The identity a delivery's shard headers carry, so a reader of the
+  transcript can tell one delivery's shards from its neighbours' whatever
+  order the lanes finished in: the leading part of the event id the lanes
+  share. Twelve hex digits tell the deliveries of one transcript apart; this
+  is not a global identifier."
+  [event-id]
+  (subs event-id 0 (min 12 (count event-id))))
+
+(defn injection-frames
+  "The frames of one delivery: each opens with `[rule-fairy shard i/n <id>]`,
+  the first carries the prefix, and the rule and documentation pieces are
+  packed in order under the frame limit."
+  [rule-names prefix delivery-id]
   (let [first-frame-body-limit (- max-hook-context-chars
                                   (count prefix)
                                   frame-header-reserve)
@@ -212,7 +256,7 @@
           packed-frames (pack-frame-pieces pieces frame-body-limit-fn)
           frame-count (count packed-frames)
           frames (mapv (fn [index frame-pieces]
-                         (str "[rule-fairy shard " (inc index) "/" frame-count "]\n"
+                         (str "[rule-fairy shard " (inc index) "/" frame-count " " delivery-id "]\n"
                               (when (zero? index) (str prefix "\n\n"))
                               (str/join frame-separator frame-pieces)))
                        (range frame-count)
@@ -224,30 +268,84 @@
                            :max-chars max-hook-context-chars}))))
       frames)))
 
-(defn- overflow-frame [required-frames rule-names]
-  (str "[rule-fairy error: required " required-frames
-       " output frames, but only " hook-lane-count " lanes are configured]\n"
-       "No matched rules were injected or marked as injected.\n"
-       "Matched rules: " (str/join ", " rule-names)))
+(defn- deferred-line [rule-names]
+  (str "[rule-fairy deferred: " (str/join ", " rule-names)
+       " (over the lane budget; delivered with the next matching event)]"))
 
-(defn- create-batch [session-id matching-rules transcript-metrics-fn prefix-fn paths]
+(defn- oversized-rule-frame [rule-name required-frames]
+  (str "[rule-fairy error: " rule-name " alone needs " required-frames
+       " output frames, but only " hook-lane-count " lanes are configured]\n"
+       "No matched rules were injected or marked as injected."))
+
+(defn- fitting-delivery
+  "The longest prefix of rule-names, in match order, whose frames fit the
+  lanes, as {:rule-names :frames :deferred}; the first frame's marker lines
+  open with the deferred rest. {:oversized name :required frame-count} when
+  the first rule alone overflows. Every shorter attempt renders again,
+  because the documentation blocks merge across the rules delivered
+  together. The deferred line counts against the first frame's limit, which
+  also bounds every piece, so a rule that alone fills all the lanes is
+  reported oversized while others are deferred; that boundary is twelve
+  frames of one rule, far above any real one."
+  [rule-names prefix-fn delivery-id]
+  (loop [delivered-count (count rule-names)]
+    (let [delivered (subvec rule-names 0 delivered-count)
+          deferred (subvec rule-names delivered-count)
+          prefix (cond->> (prefix-fn delivered)
+                   (seq deferred) (str (deferred-line deferred) "\n"))
+          frames (injection-frames delivered prefix delivery-id)]
+      (cond
+        (<= (count frames) hook-lane-count)
+        {:rule-names delivered :frames frames :deferred deferred}
+
+        (= 1 delivered-count)
+        {:oversized (first delivered) :required (count frames)}
+
+        :else
+        (recur (dec delivered-count))))))
+
+(defn- inherit-injections!
+  "The session state with the rules its transcript already shows as injected
+  marked at current-metrics, done while the session has recorded no
+  injection of its own: a forked session starts with its parent's context
+  but a fresh state file, so the first batch would deliver again what the
+  context already holds. Nil metrics mean no transcript yet, so nothing to
+  inherit."
+  [session-id state current-metrics]
+  (if (or (seq (:sizes state)) (nil? current-metrics))
+    state
+    (if-let [rule-names (seq (some-> (transcript-file session-id)
+                                     .toPath
+                                     (transcript/inherited-injections compaction-pattern)))]
+      (mark-injected! session-id state rule-names current-metrics)
+      state)))
+
+(defn- create-batch [session-id event-id matching-rules transcript-metrics-fn prefix-fn paths]
   (let [matching-rules (vec (distinct matching-rules))]
     (when (seq matching-rules)
-      (let [state (load-session-state session-id)
-            current-metrics (transcript-metrics-fn)
+      (let [current-metrics (transcript-metrics-fn)
+            state (inherit-injections! session-id (load-session-state session-id) current-metrics)
             new-rules (filterv #(needs-reinjection? state % current-metrics)
                               matching-rules)]
         (when (seq new-rules)
-          (let [frames (injection-frames new-rules (prefix-fn new-rules))
-                overflow? (> (count frames) hook-lane-count)]
-            {:rule-names (if overflow? [] new-rules)
-             :paths (vec paths)
-             :current-metrics current-metrics
-             :frames (if overflow?
-                       [(overflow-frame (count frames) new-rules)]
-                       frames)
-             :acknowledged #{}
-             :commit? (not overflow?)}))))))
+          (let [{:keys [rule-names frames deferred oversized required]}
+                (fitting-delivery new-rules prefix-fn (delivery-id event-id))]
+            (if oversized
+              {:rule-names []
+               :paths (vec paths)
+               :current-metrics current-metrics
+               :frames [(oversized-rule-frame oversized required)]
+               :acknowledged #{}
+               :commit? false}
+              ;; A delivery that defers rules keeps every path pending: the
+              ;; next shell command matches the same rules, finds the
+              ;; delivered ones recorded and delivers the rest.
+              {:rule-names rule-names
+               :paths (if (seq deferred) [] (vec paths))
+               :current-metrics current-metrics
+               :frames frames
+               :acknowledged #{}
+               :commit? true})))))))
 
 (defn- build-batch!
   "Builds and saves the event's batch, clearing the selection's paths from
@@ -257,6 +355,7 @@
   (try
     (let [{:keys [matching-rules prefix-fn paths]} (selection-fn)
           batch (or (create-batch session-id
+                                  event-id
                                   matching-rules
                                   transcript-metrics-fn
                                   prefix-fn
@@ -276,9 +375,10 @@
   read it. selection-fn returns :matching-rules, :prefix-fn and, after a
   shell command, :paths, the changed paths whose rules the event delivers:
   they leave the pending shell changes at once when nothing needs
-  delivering, once every lane has acknowledged its frame otherwise, and stay
-  pending when the frames overflow the lanes, so the next shell command
-  retries them."
+  delivering and once every lane has acknowledged its frame otherwise. They
+  stay pending while a delivery defers rules to the next event, so the next
+  shell command delivers the rest, and while a single rule is too large for
+  the lanes, which fails loudly on every command until the rule is fixed."
   [{:keys [session-id event-id lane-index transcript-metrics-fn selection-fn]}]
   (with-session-lock
     session-id

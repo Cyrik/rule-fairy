@@ -9,8 +9,11 @@
 ;; runs after a failed command too, since it may have written before failing.
 ;; A file edited and committed in the same command counts through the
 ;; commits since the last check. Paths stay pending until every lane has
-;; delivered their rules, so a rule that fails to build, a rule set too large
-;; for the lanes or a delivery cut short is retried by the next shell command.
+;; delivered their rules, so a rule that fails to build or a delivery cut
+;; short is retried by the next shell command, and a rule set too large for
+;; the lanes arrives across successive commands. The injected context names
+;; the changed paths that fit a 1,000-character budget and counts the rest,
+;; so the prefix never exceeds the frame limit on its own.
 ;; Switched off for Claude Code through `:shell-hook` in rule-fairy.edn, the
 ;; hook exits before any git call.
 ;;
@@ -47,11 +50,7 @@
                      (let [injected (set rule-names)
                            paths (keep (fn [[path rules]] (when (some injected rules) path))
                                        path->rules)]
-                       (str (str/join "\n" (map #(str "[rule-fairy injected: " % "]") rule-names))
-                            "\n[rule-fairy matched: glob on " (str/join ", " paths)
-                            ", changed by a shell command]\n\n"
-                            "Apply these rules on the next pass over this change. "
-                            "If the completed change conflicts with them, revise it before moving on.")))}))]
+                       (rule-common/shell-prefix rule-names paths)))}))]
           (when-let [{:keys [frame frame-index]}
                      (rule-common/injection-frame-for-lane!
                       {:session-id session_id

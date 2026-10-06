@@ -7,7 +7,9 @@
   extensions `promptAnyOf` and `promptRequires` by prompt text. Rule bodies may
   import documentation with standalone `@path` or `@path#heading` lines;
   imports resolve inside the project root, overlapping selections merge, and
-  `<!-- agent-context: omit -->` blocks are removed."
+  `<!-- agent-context: omit -->` blocks are removed. A line naming the
+  reference stays where the import was written, since the imported section
+  renders after the rule bodies, possibly in another shard."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [rule-fairy.config :as config]
@@ -368,15 +370,31 @@
      :headings (md/headings lines fenced?)
      :omission-ranges (omission-ranges source lines fenced?)}))
 
+(defn- import-reference
+  "An import as the rule wrote it: the path, with `#heading` when selecting
+  a section."
+  [{:keys [path fragment]}]
+  (str path (when fragment (str "#" fragment))))
+
+(defn- import-pointer
+  "The body line standing where a documentation import was written. The
+  imported section renders after every rule body, possibly in another shard,
+  so without this line a heading whose only content was the import would read
+  as an empty section."
+  [include]
+  (str "Imported: `" (import-reference include) "` (delivered as a Required context block)"))
+
 (defn- parse-rule-body [content]
   (let [lines (md/lines (:body (parse-rule content)))
         fenced-vector (md/fenced-lines lines)]
-    (reduce (fn [{:keys [body-lines] :as result} [index line]]
-              (if (fenced-vector index)
-                (update result :body-lines conj line)
-                (if-let [[_ path fragment] (re-matches include-pattern line)]
-                  (update result :includes conj {:path path :fragment fragment})
-                  (assoc result :body-lines (conj body-lines line)))))
+    (reduce (fn [result [index line]]
+              (if-let [[_ path fragment] (and (not (fenced-vector index))
+                                              (re-matches include-pattern line))]
+                (let [include {:path path :fragment fragment}]
+                  (-> result
+                      (update :includes conj include)
+                      (update :body-lines conj (import-pointer include))))
+                (update result :body-lines conj line)))
             {:body-lines [] :includes []}
             (map-indexed vector lines))))
 
@@ -425,7 +443,7 @@
                  headings)
            (count lines))])))
 
-(defn- resolve-selection [root-path document-cache {:keys [path fragment]}]
+(defn- resolve-selection [root-path document-cache {:keys [path fragment] :as include}]
   (let [real-path (include-path root-path path)
         canonical-path (str real-path)
         document (or (get @document-cache canonical-path)
@@ -434,7 +452,7 @@
                        parsed))
         [start end] (selection-range path fragment document)]
     {:canonical-path canonical-path
-     :reference (str path (when fragment (str "#" fragment)))
+     :reference (import-reference include)
      :document document
      :start start
      :end end}))

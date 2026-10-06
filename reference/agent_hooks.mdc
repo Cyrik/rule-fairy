@@ -121,7 +121,8 @@ default limit. Whether the `continue: false` path used by `hooks/codex/post_edit
 ### Required documentation
 Both paths render their payload through `rule-fairy.rules`:
 
-1. Collect standalone `@path` and `@path#heading-fragment` directives outside fenced code blocks
+1. Collect standalone `@path` and `@path#heading-fragment` directives outside fenced code blocks, leaving a line in the
+   body that names the reference where each stood, since the section renders after the rule bodies, possibly in another shard
 2. Resolve each path from the repository root and reject paths that escape it
 3. Select whole files or heading-bounded Markdown sections
 4. Merge overlapping source ranges across all matched rules, keeping which rules import each range; the block's heading names them, so a reader can tell which rule, and so which files, a section governs
@@ -144,7 +145,12 @@ Hooks share the same dedup mechanism to avoid flooding the context:
 - `:transcript-scan {:scanned-bytes n :compaction-count c}` remembers how far the transcript has been counted. Each event
   reads only the bytes appended since, and only complete lines, so a record is never split across two scans. A transcript
   shorter than the cursor is rescanned from the start. Shared implementation: `rule-fairy.transcript`.
-- First injection: always inject
+- First injection: always inject, except that a session whose transcript already holds Rule Fairy injections it has no
+  record of (a forked Claude Code session replays its parent's hook records under its own session id) starts with those
+  rules marked as injected, read once from the hook_success attachments after the last compaction summary; a frame
+  counts only when its output opens with the shard header, and a delivery only when all its shards, grouped by the
+  id in the header, are present
+  (`rule-fairy.transcript/inherited-injections`)
 - Subsequent: re-inject after context compaction or **2MB of transcript growth** since last injection. Transcript growth is a deliberately
   coarse fallback for silent context cleanup that can discard earlier hook injections without a normal compaction record.
 - Existing numeric state entries are treated as pre-compaction metrics and migrate on their next injection
@@ -196,8 +202,9 @@ entries whose modification or inode change time is at or after the session's las
 commits since that check's HEAD touched, and the matching rules are injected with the post-edit contract. The check is
 the marker the prompt hook starts and every shell check advances; paths stay pending in the session state until their
 rules were delivered (on Claude once every lane of the batch has acknowledged its frame, on Codex once the injection is
-prepared) and are otherwise retried by the next shell command, so a broken rule or a rule set too large for the lanes
-fails loudly on every command until it is fixed rather than silently losing the edit. Consequences to keep in mind: the rules arrive one model cycle after the
+prepared) and are otherwise retried by the next shell command, so a broken rule or a delivery cut short is retried
+rather than silently losing the edit, a rule set too large for the lanes arrives across successive commands, and a
+single rule too large for the lanes fails loudly on every command until it is fixed. Consequences to keep in mind: the rules arrive one model cycle after the
 write, never before it; a moved file counts through its inode change time, since `mv` keeps the modification time; times
 compare at whole seconds so a coarse filesystem cannot hide an edit; a write by another session between two checks is
 attributed to this one and injects its rules once; ignored files and deletions are never reported; and outside a git
@@ -247,7 +254,8 @@ and batch files, is written through `rule-fairy.session-state/replace-file!`: a 
 moved into place atomically. A plain truncating write lets a concurrent reader see partial EDN and fail its hook.
 
 The lanes' outputs land in the transcript in arrival order, not lane order, so a rule split across shards can read out of
-sequence; the `[rule-fairy shard n/m]` labels are what lets the model reassemble it. Anything that must read in order
+sequence; the `[rule-fairy shard n/m <delivery>]` labels are what lets the model reassemble it, and the delivery id is
+what lets the fork reader tell neighbouring deliveries apart. Anything that must read in order
 belongs in one shard, and per-lane commentary would either repeat on every lane or arrive scrambled. This has not caused
 trouble so far, and whether Claude guarantees any ordering for the hooks of one event is unchecked.
 

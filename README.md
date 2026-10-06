@@ -32,7 +32,9 @@ Cursor has `.cursor/rules/`. Rule Fairy exists for what they leave out:
 - **Heading-level documentation imports.** `@doc/guide.md#section` pulls one
   section of a larger document into a rule; overlapping imports merge and
   `<!-- agent-context: omit -->` blocks stay out. Native imports take whole
-  files.
+  files. The rendered rule keeps a line where the import stood, naming the
+  reference, because the section itself is delivered in the Required
+  documentation blocks, possibly in another shard.
 - **Reinjection after compaction.** After `/compact`, Claude Code re-injects
   only the root `CLAUDE.md`, and path-scoped rules return only when a
   matching file is read again. Rule Fairy counts compactions per session and
@@ -92,18 +94,28 @@ request also needs the GitHub CLI (`gh`), logged in.
   A file edited and committed in the same command is seen through the
   commits since the last check, and a change stays pending until its rules
   have reached the agent, so a rule that fails to build or a delivery cut
-  short is retried by the next command. Outside a git checkout nothing is
-  detected. On by default for Claude Code and off for Codex; `:shell-hook`
+  short is retried by the next command. On Claude Code, the injected
+  context names the changed paths that fit a 1,000-character budget and
+  counts the rest, so the prefix never exceeds the frame limit on its own.
+  Outside a git checkout nothing is detected. On by default for Claude Code and off for Codex; `:shell-hook`
   in `rule-fairy.edn` switches either (see Configuration).
 - **Dedup**: one state file per session records when each rule was injected.
   A rule is injected again after a compaction, or after 2 MiB of transcript
-  growth as a fallback for silent context cleanup. State lives under
+  growth as a fallback for silent context cleanup. A session whose
+  transcript already holds Rule Fairy injections it has no record of, as
+  after a fork, starts with those rules marked as injected, read from the
+  hook records after the last compaction summary; a delivery counts only
+  when every one of its shards, told apart by the delivery id in the shard
+  header, is recorded. State lives under
   `.rule-fairy/<harness>/` in the project and ignores itself in git.
 - **Bounded delivery**: Claude Code truncates hook output over 10,000
   characters (anthropics/claude-code#94358, not configurable), so the Claude
   hooks register 12 lanes per event and split one injection across them.
-  Codex caps `additionalContext` at 2,500 tokens by default; the registration
-  sets `additionalContextLimit` to 0.
+  A matched set that needs more frames than there are lanes is delivered in
+  match order as far as it fits; the first shard names the rest, which comes
+  with the next event that matches it. A single rule too large for the lanes
+  is reported and never marked. Codex caps `additionalContext` at 2,500
+  tokens by default; the registration sets `additionalContextLimit` to 0.
 - **Review skill** (`rule-fairy:review`, both harnesses): fetches a diff (a
   pull request through `gh`, uncommitted work, or a branch against its base),
   builds a bundle of the instruction files, rules and documentation that apply
@@ -259,7 +271,7 @@ per hook entry.
 
 Context injected by the hooks is labelled `[rule-fairy injected: <rule>]`,
 `[rule-fairy matched: alwaysApply ...]`, `[rule-fairy matched: keyword ...]`,
-`[rule-fairy matched: glob on <path>]`, `[rule-fairy shard n/m]`, and
+`[rule-fairy matched: glob on <path>]`, `[rule-fairy shard n/m <delivery>]`, and
 `[rule-fairy error: ...]`.
 
 ## Using the review from another skill
