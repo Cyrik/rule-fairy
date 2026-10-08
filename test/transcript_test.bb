@@ -151,7 +151,7 @@
 
         (testing "only the injected markers after the header name rules, in a real first frame's order"
           (records (prompt-record (frame "d1" 1 1
-                                         "[rule-fairy deferred: c.mdc (over the lane budget; delivered with the next matching event)]"
+                                         "[rule-fairy deferred: c.mdc (past what one delivery can carry; delivered with the next matching event)]"
                                          (injected "a.mdc")
                                          (injected "b.mdc")
                                          "[rule-fairy matched: alwaysApply a.mdc]")))

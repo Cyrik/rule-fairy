@@ -270,36 +270,52 @@
 
 (defn- deferred-line [rule-names]
   (str "[rule-fairy deferred: " (str/join ", " rule-names)
-       " (over the lane budget; delivered with the next matching event)]"))
+       " (past what one delivery can carry; delivered with the next matching event)]"))
 
-(defn- oversized-rule-frame [rule-name required-frames]
-  (str "[rule-fairy error: " rule-name " alone needs " required-frames
-       " output frames, but only " hook-lane-count " lanes are configured]\n"
+(defn- oversized-rule-frame [rule-name reason]
+  (str "[rule-fairy error: " rule-name " alone " reason "]\n"
        "No matched rules were injected or marked as injected."))
 
+(defn- documentation-over-budget?
+  "True for the engine's documentation budget error, which carries the byte
+  counts. Any other rendering error is a broken rule and stays an error."
+  [error]
+  (contains? (ex-data error) :expanded-bytes))
+
 (defn- fitting-delivery
-  "The longest prefix of rule-names, in match order, whose frames fit the
-  lanes, as {:rule-names :frames :deferred}; the first frame's marker lines
-  open with the deferred rest. {:oversized name :required frame-count} when
-  the first rule alone overflows. Every shorter attempt renders again,
-  because the documentation blocks merge across the rules delivered
-  together. The deferred line counts against the first frame's limit, which
-  also bounds every piece, so a rule that alone fills all the lanes is
-  reported oversized while others are deferred; that boundary is twelve
-  frames of one rule, far above any real one."
+  "The longest prefix of rule-names, in match order, that fits one delivery:
+  its frames within the lanes and its documentation within the engine's
+  budget, as {:rule-names :frames :deferred}; the first frame's marker lines
+  open with the deferred rest. {:oversized name :reason text} when the first
+  rule alone fits neither. Every shorter attempt renders again, because the
+  documentation blocks merge across the rules delivered together. The
+  deferred line counts against the first frame's limit, which also bounds
+  every piece, so a rule that alone fills all the lanes is reported
+  oversized while others are deferred; that boundary is twelve frames of
+  one rule, far above any real one."
   [rule-names prefix-fn delivery-id]
   (loop [delivered-count (count rule-names)]
     (let [delivered (subvec rule-names 0 delivered-count)
           deferred (subvec rule-names delivered-count)
           prefix (cond->> (prefix-fn delivered)
                    (seq deferred) (str (deferred-line deferred) "\n"))
-          frames (injection-frames delivered prefix delivery-id)]
+          {:keys [frames over-budget]} (try
+                                         {:frames (injection-frames delivered prefix delivery-id)}
+                                         (catch clojure.lang.ExceptionInfo error
+                                           (if (documentation-over-budget? error)
+                                             {:over-budget (ex-data error)}
+                                             (throw error))))]
       (cond
-        (<= (count frames) hook-lane-count)
+        (and frames (<= (count frames) hook-lane-count))
         {:rule-names delivered :frames frames :deferred deferred}
 
         (= 1 delivered-count)
-        {:oversized (first delivered) :required (count frames)}
+        {:oversized (first delivered)
+         :reason (if over-budget
+                   (str "expands to " (:expanded-bytes over-budget)
+                        " bytes of documentation, over the " (:max-bytes over-budget) "-byte budget")
+                   (str "needs " (count frames) " output frames, but only "
+                        hook-lane-count " lanes are configured"))}
 
         :else
         (recur (dec delivered-count))))))
@@ -328,13 +344,13 @@
             new-rules (filterv #(needs-reinjection? state % current-metrics)
                               matching-rules)]
         (when (seq new-rules)
-          (let [{:keys [rule-names frames deferred oversized required]}
+          (let [{:keys [rule-names frames deferred oversized reason]}
                 (fitting-delivery new-rules prefix-fn (delivery-id event-id))]
             (if oversized
               {:rule-names []
                :paths (vec paths)
                :current-metrics current-metrics
-               :frames [(oversized-rule-frame oversized required)]
+               :frames [(oversized-rule-frame oversized reason)]
                :acknowledged #{}
                :commit? false}
               ;; A delivery that defers rules keeps every path pending: the

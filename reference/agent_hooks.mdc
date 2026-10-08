@@ -129,7 +129,7 @@ Both paths render their payload through `rule-fairy.rules`:
 5. Remove non-nested `<!-- agent-context: omit -->` blocks
 6. Append the selected canonical documentation to the rule payload
 
-The expanded documentation has a 64 KiB safety budget per hook payload. Missing files, missing headings, invalid omission markers, and oversized payloads fail instead of silently dropping required context.
+The expanded documentation has a 64 KiB safety budget per hook payload. Missing files, missing headings, invalid omission markers, and oversized payloads fail instead of silently dropping required context. On Claude Code a matched set over the budget is delivered as far as it fits and the rest deferred to the next matching event, as for a set too large for the lanes; a single rule over the budget still fails.
 
 ## Dedup / Reinjection
 

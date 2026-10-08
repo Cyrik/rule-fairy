@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "rule-fairy",
-      "version": "0.2.1",
+      "version": "0.2.2",
       "source": "./",
       "description": "Injects Cursor-style rules into Claude Code and Codex by prompt keyword, edited path, or alwaysApply."
     }

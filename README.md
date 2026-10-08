@@ -111,10 +111,11 @@ request also needs the GitHub CLI (`gh`), logged in.
 - **Bounded delivery**: Claude Code truncates hook output over 10,000
   characters (anthropics/claude-code#94358, not configurable), so the Claude
   hooks register 12 lanes per event and split one injection across them.
-  A matched set that needs more frames than there are lanes is delivered in
-  match order as far as it fits; the first shard names the rest, which comes
-  with the next event that matches it. A single rule too large for the lanes
-  is reported and never marked. Codex caps `additionalContext` at 2,500
+  A matched set that needs more frames than there are lanes, or more
+  documentation than the 64 KiB budget, is delivered in match order as far
+  as it fits; the first shard names the rest, which comes with the next
+  event that matches it. A single rule too large for either is reported and
+  never marked. Codex caps `additionalContext` at 2,500
   tokens by default; the registration sets `additionalContextLimit` to 0.
 - **Review skill** (`rule-fairy:review`, both harnesses): fetches a diff (a
   pull request through `gh`, uncommitted work, or a branch against its base),

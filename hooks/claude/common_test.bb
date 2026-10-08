@@ -359,7 +359,7 @@
                   (is (= 2 (count frames)))
                   (is (= "[rule-fairy shard 1/2 event]" header)
                       "the header carries the delivery id, the leading part of the event id")
-                  (is (= "[rule-fairy deferred: beta.mdc, gamma.mdc (over the lane budget; delivered with the next matching event)]"
+                  (is (= "[rule-fairy deferred: beta.mdc, gamma.mdc (past what one delivery can carry; delivered with the next matching event)]"
                          deferred-line))
                   (is (= "[rule-fairy injected: alpha.mdc]" injected-line))
                   (is (str/starts-with? (second frames) "[rule-fairy shard 2/2 event]\n")))
@@ -380,6 +380,54 @@
                     (rule-common/complete-injection-frame! "session" "event" frame-index))
                   (is (= {"alpha.mdc" current-metrics}
                          (:sizes (rule-common/load-session-state "session")))))))))))))
+
+(deftest documentation-budget-is-part-of-what-fits-test
+  (let [paragraphs (fn [heading n]
+                     (str/join "\n\n" (map #(str heading " paragraph " % ": " (apply str (repeat 960 "d"))) (range n))))
+        section (fn [heading] (str "## " heading "\n\n" (paragraphs heading 20)))
+        rule (fn [heading] (str "---\nglobs: apps/**/*.clj\nalwaysApply: false\n---\n# " heading "\n\n@doc/guide.md#" heading "\n"))
+        request (fn [lane-index matching-rules]
+                  {:session-id "session"
+                   :event-id (str/join "-" matching-rules)
+                   :lane-index lane-index
+                   :transcript-metrics-fn (constantly current-metrics)
+                   :selection-fn (fn []
+                                   {:matching-rules matching-rules
+                                    :prefix-fn (fn [names]
+                                                 (str/join "\n" (map #(str "[rule-fairy injected: " % "]") names)))})})
+        deliveries (fn [matching-rules]
+                     (->> (range rule-common/hook-lane-count)
+                          (keep #(rule-common/injection-frame-for-lane! (request % matching-rules)))
+                          vec))]
+    (with-temp-rules
+      {"doc/guide.md" (str "# Guide\n\n" (str/join "\n\n" (map section ["one" "two" "three" "four"]))
+                           "\n\n## big\n\n" (paragraphs "big" 70))
+       ".cursor/rules/a.mdc" (rule "one")
+       ".cursor/rules/b.mdc" (rule "two")
+       ".cursor/rules/c.mdc" (rule "three")
+       ".cursor/rules/d.mdc" (rule "four")
+       ".cursor/rules/e.mdc" (rule "big")}
+      (fn [_]
+        (with-temp-state
+          (fn []
+            (testing "four rules whose documentation together passes 64 KiB: three delivered, the fourth deferred"
+              (let [delivered (deliveries ["a.mdc" "b.mdc" "c.mdc" "d.mdc"])
+                    first-frame (:frame (first delivered))]
+                (is (<= 2 (count delivered) rule-common/hook-lane-count))
+                (is (str/includes? first-frame "[rule-fairy deferred: d.mdc (past what one delivery can carry; delivered with the next matching event)]"))
+                (is (str/includes? first-frame "[rule-fairy injected: c.mdc]"))
+                (is (not (str/includes? first-frame "[rule-fairy injected: d.mdc]")))
+                (doseq [{:keys [frame-index]} delivered]
+                  (rule-common/complete-injection-frame! "session" "a.mdc-b.mdc-c.mdc-d.mdc" frame-index))
+                (is (= {"a.mdc" current-metrics "b.mdc" current-metrics "c.mdc" current-metrics}
+                       (:sizes (rule-common/load-session-state "session"))))))
+            (testing "a single rule whose documentation alone passes the budget is reported, not marked"
+              (let [{:keys [frame frame-index]} (first (deliveries ["e.mdc"]))]
+                (is (str/includes? frame "[rule-fairy error: e.mdc alone expands to "))
+                (is (str/includes? frame " bytes of documentation, over the 65536-byte budget]"))
+                (is (str/includes? frame "No matched rules were injected"))
+                (rule-common/complete-injection-frame! "session" "e.mdc" frame-index)
+                (is (not (contains? (:sizes (rule-common/load-session-state "session")) "e.mdc")))))))))))
 
 (defn registered-command
   "The command the plugin registers for an event and lane."
@@ -792,7 +840,7 @@
                               :selection-fn (constantly {:matching-rules ["a.mdc" "b.mdc"]
                                                          :prefix-fn (fn [names] (str "injected " (str/join "," names)))}))
               {:keys [frame frame-index]} (rule-common/injection-frame-for-lane! (request "first"))]
-          (is (= (str "[rule-fairy deferred: b.mdc (over the lane budget; delivered with the next matching event)]\n"
+          (is (= (str "[rule-fairy deferred: b.mdc (past what one delivery can carry; delivered with the next matching event)]\n"
                       "injected a.mdc"
                       "|a.mdc")
                  frame)

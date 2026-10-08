@@ -11,7 +11,7 @@
 ;; commits since the last check. Paths stay pending until every lane has
 ;; delivered their rules, so a rule that fails to build or a delivery cut
 ;; short is retried by the next shell command, and a rule set too large for
-;; the lanes arrives across successive commands. The injected context names
+;; the lanes or the documentation budget arrives across successive commands. The injected context names
 ;; the changed paths that fit a 1,000-character budget and counts the rest,
 ;; so the prefix never exceeds the frame limit on its own.
 ;; Switched off for Claude Code through `:shell-hook` in rule-fairy.edn, the
