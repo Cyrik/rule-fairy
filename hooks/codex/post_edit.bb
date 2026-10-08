@@ -3,12 +3,12 @@
 ;; PostToolUse hook for edits. After an apply_patch or edit tool call the
 ;; edited paths come from the tool input; after a Bash command, which can
 ;; write files no input names, they are the files changed since the session's
-;; last shell check (see rule-fairy.changes), commits in that command
-;; included, plus any still pending from a check whose rules could not be
-;; built. Either way the matching rules are injected with the post-edit
-;; contract: apply them on the next pass and revise the finished change
-;; where it conflicts. The shell path is off unless `:shell-hook {:codex
-;; true}` is set in rule-fairy.edn; a Bash event then ends here.
+;; last shell check (see rule-fairy.changes), plus any still pending from a
+;; check whose rules could not be built. Either way the matching rules are
+;; injected with the post-edit contract: apply them on the next pass and
+;; revise the finished change where it conflicts. The shell path is off
+;; unless `:shell-hook {:codex true}` is set in rule-fairy.edn; a Bash event
+;; then ends here.
 
 (require '[clojure.java.io :as io])
 

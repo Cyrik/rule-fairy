@@ -3,12 +3,12 @@
   find the files a shell command wrote, where no tool input names them:
   after the command, everything git reports as modified, added, renamed or
   untracked whose file changed at or after the session's last shell check
-  is a change made through the shell, and so is everything the commits
-  since that check's HEAD touched, which covers a file edited and committed
-  in one command. The session state keeps the check (`:shell-check`,
-  `:shell-head`) and the paths found but not yet delivered
-  (`:shell-pending`), so a check whose rules never reached the agent is
-  retried by the next one."
+  is a change made through the shell. Only the working tree is read: a
+  commit, checkout, rebase or pull that moves HEAD brings nothing, and a
+  file written and committed in the same command is not seen. The session
+  state keeps the check (`:shell-check`) and the paths found but not yet
+  delivered (`:shell-pending`), so a check whose rules never reached the
+  agent is retried by the next one."
   (:require [babashka.fs :as fs]
             [clojure.string :as str]
             [rule-fairy.config :as config]
@@ -63,19 +63,14 @@
          sort
          vec)))
 
-(defn- locate-checkout
-  "The checkout holding project-root as {:top real-path :head oid}, the head
-  nil before the first commit; nil outside git. One process answers both,
-  since spawning one costs more than either lookup: before the first commit
-  git echoes the unresolved `HEAD` and exits 128, outside git it prints
-  nothing."
+(defn- checkout-top
+  "The real path of the checkout holding project-root; nil outside git,
+  where rev-parse exits 128 and prints nothing."
   [project-root]
-  (let [[top head] (str/split-lines
-                    (git/run project-root ["git" "rev-parse" "--show-toplevel" "HEAD"]
-                             {:ok-exits #{0 128}}))]
+  (let [top (str/trim-newline (git/run project-root ["git" "rev-parse" "--show-toplevel"]
+                                       {:ok-exits #{0 128}}))]
     (when-not (str/blank? top)
-      {:top (fs/real-path top)
-       :head (when (and head (re-matches #"[0-9a-f]+" head)) head)})))
+      (fs/real-path top))))
 
 (defn- working-tree-changes
   "The changed-since listing for a checkout whose top is known."
@@ -96,66 +91,30 @@
   deletions left out, a rename counted for its new path. Nil outside a git
   checkout."
   [project-root marker-ms]
-  (when-let [{:keys [top]} (locate-checkout project-root)]
+  (when-let [top (checkout-top project-root)]
     (working-tree-changes project-root top marker-ms)))
-
-(defn- commit-changes
-  "The committed-since listing for a located checkout; nil before its first
-  commit."
-  [project-root {:keys [top head]} from-head]
-  (when head
-    (if (= head from-head)
-      []
-      (let [base (or from-head (git/empty-tree-oid project-root))
-            output (git/run project-root ["git" "diff" "--name-only" "-z" "--diff-filter=ACMR" base head])]
-        (project-paths project-root top (remove str/blank? (str/split output nul-pattern)))))))
-
-(defn committed-since
-  "The files under project-root that the commits after from-head added,
-  changed, renamed or copied, up to the current HEAD, as paths relative to
-  project-root. A nil from-head counts everything ever committed. Empty
-  when HEAD is still from-head; nil outside a git checkout or before the
-  first commit."
-  [project-root from-head]
-  (commit-changes project-root (locate-checkout project-root) from-head))
 
 ;;; Session state
 
-(defn- check-keys
-  "The session-state keys of a check that started at started-ms with HEAD
-  at head. started-ms must precede every git lookup of the check, so a
-  write made while it runs is at or after the marker and the next check
-  sees it."
-  [started-ms head]
-  {:shell-check started-ms
-   :shell-head head})
-
 (defn start-check
-  "The session-state keys that begin shell checking now: the current time
-  and HEAD."
-  [project-root]
-  (let [started (System/currentTimeMillis)]
-    (check-keys started (:head (locate-checkout project-root)))))
+  "The session-state key that begins shell checking now. The time must
+  precede every git lookup of a check, so a write made while the check
+  runs is at or after the marker and the next check sees it."
+  []
+  {:shell-check (System/currentTimeMillis)})
 
 (defn check
   "One shell check against a session state: {:state state' :paths paths},
   where state' carries the check advanced to now and every path found but
   not yet delivered, and paths lists all of those. A state without a check
-  starts one and finds nothing. Files changed in the working tree count
-  through their times, files committed since the check's HEAD through the
-  commits; the HEAD is only consulted once a check has recorded one. Throws
-  when git fails, leaving the state untouched so the next check covers the
-  same window."
+  starts one and finds nothing. Throws when git fails, leaving the state
+  untouched so the next check covers the same window."
   [state project-root]
-  (let [started (System/currentTimeMillis)
-        checkout (locate-checkout project-root)
-        {:keys [shell-check shell-head shell-pending]} state
-        found (when (and shell-check checkout)
-                (concat (working-tree-changes project-root (:top checkout) shell-check)
-                        (when (contains? state :shell-head)
-                          (commit-changes project-root checkout shell-head))))
+  (let [started (start-check)
+        {:keys [shell-check shell-pending]} state
+        found (when shell-check (changed-since project-root shell-check))
         pending (vec (into (sorted-set) (concat shell-pending found)))]
-    {:state (merge state (check-keys started (:head checkout)) {:shell-pending pending})
+    {:state (merge state started {:shell-pending pending})
      :paths pending}))
 
 (defn delivered

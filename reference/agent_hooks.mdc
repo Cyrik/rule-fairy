@@ -198,8 +198,8 @@ an interpreter one-liner) reaches no edit hook, and Claude Code's auto mode nudg
 auto-mode transcripts at least one source edit in five went through the shell. The shell hook (`hooks/claude/shell.bb`
 on `PostToolUse` and `PostToolUseFailure` for `Bash`; `hooks/codex/post_edit.bb` when `tool_name` is `Bash`, which is
 the name both harnesses give the shell tool) closes that gap after the fact: `rule-fairy.changes` lists the `git status`
-entries whose modification or inode change time is at or after the session's last shell check, plus the files the
-commits since that check's HEAD touched, and the matching rules are injected with the post-edit contract. The check is
+entries whose modification or inode change time is at or after the session's last shell check, and the matching rules
+are injected with the post-edit contract. The check is
 the marker the prompt hook starts and every shell check advances; paths stay pending in the session state until their
 rules were delivered (on Claude once every lane of the batch has acknowledged its frame, on Codex once the injection is
 prepared) and are otherwise retried by the next shell command, so a broken rule or a delivery cut short is retried
@@ -207,8 +207,9 @@ rather than silently losing the edit, a rule set too large for the lanes arrives
 single rule too large for the lanes fails loudly on every command until it is fixed. Consequences to keep in mind: the rules arrive one model cycle after the
 write, never before it; a moved file counts through its inode change time, since `mv` keeps the modification time; times
 compare at whole seconds so a coarse filesystem cannot hide an edit; a write by another session between two checks is
-attributed to this one and injects its rules once; ignored files and deletions are never reported; and outside a git
-checkout nothing is detected. The check is switched per harness by `:shell-hook` in `rule-fairy.edn`, on for Claude
+attributed to this one and injects its rules once; ignored files and deletions are never reported; only the working
+tree is read, so a commit, checkout, rebase or pull that moves HEAD brings nothing and a file written and committed in
+the same command is not seen; and outside a git checkout nothing is detected. The check is switched per harness by `:shell-hook` in `rule-fairy.edn`, on for Claude
 Code and off for Codex by default, because Codex makes many shell calls and rarely edits through them. Codex runs
 `PostToolUse` after a command that exits non-zero as well, with no separate failure event and no exit code in the
 input, so where the hook is on a write made before the failure is seen. `FileChanged` was not used because it delivers no context to the model and

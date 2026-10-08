@@ -563,19 +563,12 @@
         (with-redefs [rule-common/state-dir (str (io/file root ".rule-fairy/claude"))]
           (let [state (rule-common/load-session-state "session-shell")]
             (is (number? (:shell-check state)))
-            (is (string? (:shell-head state)))
             (is (= [] (:shell-pending state))))))
-      (testing "a file edited and committed in one command is still seen"
-        ;; A clean tree first, so the new session's check sees only the commit.
+      (testing "a commit that moves HEAD injects nothing: the check reads the working tree, not the commits"
+        (run-prompt-hook root "session-commit" "hello")
         (git! root "add" "-A")
         (git! root "commit" "-q" "-m" "earlier shell writes")
-        (run-prompt-hook root "session-commit" "hello")
-        (spit (io/file root "src/d.clj") "(ns d)\n")
-        (git! root "add" "src/d.clj")
-        (git! root "commit" "-q" "-m" "edited and committed in one command")
-        (let [context (run-shell-hook :PostToolUse root "session-commit")]
-          (is (str/includes? context "[rule-fairy injected: widget.mdc]"))
-          (is (str/includes? context "[rule-fairy matched: glob on src/d.clj, changed by a shell command]")))))))
+        (is (nil? (run-shell-hook :PostToolUse root "session-commit")))))))
 
 (deftest shell-hook-disabled-test
   (with-temp-project

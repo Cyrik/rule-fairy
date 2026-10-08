@@ -91,10 +91,11 @@ request also needs the GitHub CLI (`gh`), logged in.
   them against the globs and injects the rules with the post-edit contract:
   apply them on the next pass, revise the change where it conflicts. The
   check advances with every shell command and starts at the first prompt.
-  A file edited and committed in the same command is seen through the
-  commits since the last check, and a change stays pending until its rules
-  have reached the agent, so a rule that fails to build or a delivery cut
-  short is retried by the next command. On Claude Code, the injected
+  The check reads the working tree, so a commit, checkout, rebase or pull
+  that moves HEAD brings nothing, and a file written and committed in the
+  same command is not seen. A change stays pending until its rules have
+  reached the agent, so a rule that fails to build or a delivery cut short
+  is retried by the next command. On Claude Code, the injected
   context names the changed paths that fit a 1,000-character budget and
   counts the rest, so the prefix never exceeds the frame limit on its own.
   Outside a git checkout nothing is detected. On by default for Claude Code and off for Codex; `:shell-hook`

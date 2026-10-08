@@ -157,7 +157,7 @@
       (let [state (load-session-state session-id)]
         (when-not (:shell-check state)
           (save-session-state! session-id
-                               (merge state (changes/start-check project-root))))))))
+                               (merge state (changes/start-check))))))))
 
 (defn shell-changes!
   "The project-relative paths of files changed since the session's last shell

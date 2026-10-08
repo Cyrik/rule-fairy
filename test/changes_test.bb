@@ -4,7 +4,6 @@
   (:require [babashka.fs :as fs]
             [babashka.process :as p]
             [clojure.java.io :as io]
-            [clojure.string :as str]
             [clojure.test :refer [deftest is run-tests testing]]
             [rule-fairy.changes :as changes]
             [rule-fairy.git :as git]))
@@ -72,34 +71,17 @@
     (try
       (git! root "init" "-q" "--initial-branch=main")
       (write! root "tracked.clj" "(ns tracked)\n")
+      (write! root " leading.clj" "(ns leading)\n")
       (git! root "add" "-A")
       (git! root "commit" "-q" "-m" "base")
-      (let [base (str/trim (:out (git! root "rev-parse" "HEAD")))]
-        (write! root "tracked.clj" "(ns tracked) :edited\n")
-        (is (= ["tracked.clj"] (changes/changed-since (str root) 0))
-            "an unstaged edit to a tracked file, whose status entry begins with a space, is the only change")
-        (write! root " leading.clj" "(ns leading)\n")
-        (git! root "add" "-A")
-        (git! root "commit" "-q" "-m" "next")
-        (is (= [" leading.clj" "tracked.clj"] (changes/committed-since (str root) base))
-            "a committed file name keeps its leading space"))
+      (write! root "tracked.clj" "(ns tracked) :edited\n")
+      (is (= ["tracked.clj"] (changes/changed-since (str root) 0))
+          "an unstaged edit to a tracked file, whose status entry begins with a space, is the only change")
+      (write! root " leading.clj" "(ns leading) :edited\n")
+      (is (= [" leading.clj" "tracked.clj"] (changes/changed-since (str root) 0))
+          "a file name keeps its leading space")
       (finally
         (fs/delete-tree root)))))
-
-(deftest committed-since-test
-  (with-temp-repo
-    (fn [root]
-      (let [base (str/trim (:out (git! root "rev-parse" "HEAD")))]
-        (is (= [] (changes/committed-since (str root) base)) "nothing committed since HEAD itself")
-        (write! root "sub/committed.clj" "(ns committed)\n")
-        (write! root "a.txt" "changed and committed\n")
-        (git! root "add" "-A")
-        (git! root "commit" "-q" "-m" "next")
-        (is (= ["a.txt" "sub/committed.clj"] (changes/committed-since (str root) base)))
-        (is (= ["committed.clj"] (changes/committed-since (str (fs/path root "sub")) base))
-            "relative to a project root inside the repository")
-        (is (= 7 (count (changes/committed-since (str root) nil)))
-            "without a starting HEAD, everything ever committed")))))
 
 (deftest check-and-delivered-test
   (with-temp-repo
@@ -107,22 +89,34 @@
       (let [started (changes/check {} (str root))]
         (is (= [] (:paths started)) "the first check starts the marker and finds nothing")
         (is (number? (get-in started [:state :shell-check])))
-        (is (string? (get-in started [:state :shell-head])))
         (write! root "sub/new.clj" "(ns new)\n")
-        (write! root "sub/committed.clj" "(ns committed)\n")
-        (git! root "add" "sub/committed.clj")
-        (git! root "commit" "-q" "-m" "committed in the same command")
+        (write! root "sub/other.clj" "(ns other)\n")
         (let [checked (changes/check (:state started) (str root))]
-          (is (= ["sub/committed.clj" "sub/new.clj"] (:paths checked))
-              "working-tree and committed changes together")
+          (is (= ["sub/new.clj" "sub/other.clj"] (:paths checked)))
           (is (= (:paths checked) (get-in checked [:state :shell-pending])))
           (is (= (:paths checked) (:paths (changes/check (:state checked) (str root))))
               "undelivered paths stay pending across checks")
-          (is (= ["sub/committed.clj"]
-                 (:shell-pending (changes/delivered (:state checked) ["sub/new.clj"]))))))
-      (testing "a state from before HEAD tracking does not diff from the empty tree"
-        (let [{:keys [paths]} (changes/check {:shell-check (System/currentTimeMillis)} (str root))]
-          (is (not-any? #{"a.txt"} paths)))))))
+          (is (= ["sub/other.clj"]
+                 (:shell-pending (changes/delivered (:state checked) ["sub/new.clj"])))))))))
+
+(deftest head-moves-report-nothing-test
+  (with-temp-repo
+    (fn [root]
+      (git! root "switch" "-q" "-c" "other")
+      (write! root "sub/on-other.clj" "(ns on-other)\n")
+      (write! root "a.txt" "rewritten on other\n")
+      (git! root "add" "-A")
+      (git! root "commit" "-q" "-m" "on other")
+      (git! root "switch" "-q" "main")
+      (write! root "sub/written-earlier.clj" "(ns written-earlier)\n")
+      (let [started (changes/check {} (str root))]
+        (testing "committing a file written before the check reports nothing: the check reads the working tree, not the commits"
+          (git! root "add" "-A")
+          (git! root "commit" "-q" "-m" "written before the check")
+          (is (= [] (:paths (changes/check (:state started) (str root))))))
+        (testing "a branch switch that rewrites tracked files reports nothing"
+          (git! root "switch" "-q" "other")
+          (is (= [] (:paths (changes/check (:state started) (str root))))))))))
 
 (deftest write-during-check-test
   (with-temp-repo
@@ -149,11 +143,8 @@
       (write! root "a.clj" "(ns a)\n")
       (testing "a repository without a commit yet"
         (is (= ["a.clj"] (changes/changed-since (str root) 0)))
-        (is (nil? (changes/committed-since (str root) nil)))
-        (is (nil? (:shell-head (changes/start-check (str root)))))
         (let [started (changes/check {} (str root))]
           (is (= [] (:paths started)))
-          (is (contains? (:state started) :shell-head))
           (is (= ["a.clj"]
                  (:paths (changes/check (assoc (:state started) :shell-check 0) (str root)))))))
       (finally
@@ -182,6 +173,17 @@
               config)))
       (finally
         (fs/delete-tree dir)))))
+
+(deftest trailing-space-in-checkout-path-test
+  (let [tmp (fs/create-temp-dir {:prefix "rule-fairy-changes-space"})
+        root (fs/create-dirs (fs/path tmp "checkout "))]
+    (try
+      (git! root "init" "-q" "--initial-branch=main")
+      (write! root "source.clj" "(ns source)\n")
+      (is (= ["source.clj"] (changes/changed-since (str root) 0))
+          "the checkout path keeps its trailing space; only git's line terminator is dropped")
+      (finally
+        (fs/delete-tree tmp)))))
 
 (deftest outside-git-test
   (let [dir (fs/create-temp-dir {:prefix "rule-fairy-changes-plain"})]
