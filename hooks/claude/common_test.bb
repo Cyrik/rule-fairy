@@ -11,7 +11,7 @@
 (def hooks-directory (.getParentFile (.getAbsoluteFile (io/file *file*))))
 (def repository-directory (.getParentFile (.getParentFile hooks-directory)))
 
-;; The lane test validates a hook registration file, by default the plugin's own.
+;; The registration test validates a hooks manifest, by default the plugin's own.
 (def settings-file
   (or (System/getenv "RULE_FAIRY_SETTINGS_FILE")
       (str (io/file repository-directory "hooks/hooks.json"))))
@@ -33,11 +33,6 @@
    :lane-index lane-index
    :transcript-metrics-fn (constantly current-metrics)
    :selection-fn test-selection})
-
-(defn configured-hook-lane [command]
-  (some-> (re-find #"RULE_FAIRY_LANE=(\d+)" command)
-          second
-          parse-long))
 
 (defn with-temp-project [files f]
   (let [root (.toFile
@@ -429,58 +424,59 @@
                 (rule-common/complete-injection-frame! "session" "e.mdc" frame-index)
                 (is (not (contains? (:sizes (rule-common/load-session-state "session")) "e.mdc")))))))))))
 
-(defn registered-command
-  "The command the plugin registers for an event and lane."
-  [event lane]
-  (let [settings (json/parse-string (slurp settings-file) true)]
-    (:command (nth (get-in settings [:hooks event 0 :hooks]) lane))))
+(defn mod-result
+  "Runs the mod's entry script the way hooks/claude/register.ts does: through
+  the launcher with the plugin root and project directory exported, from the
+  given working directory, {kind input} on stdin. {:exit :out :err}, whatever
+  the exit; env adds environment variables."
+  ([kind project-root cwd input]
+   (mod-result kind project-root cwd input {}))
+  ([kind project-root cwd input env]
+   (p/shell {:dir (str cwd)
+             :in (json/generate-string {:kind kind :input input})
+             :out :string
+             :err :string
+             :continue true
+             :extra-env (merge {"CLAUDE_PLUGIN_ROOT" (str repository-directory)
+                                "CLAUDE_PROJECT_DIR" (str project-root)}
+                               env)}
+            (str (io/file repository-directory "hooks/run")) "claude/mod.bb")))
 
-(defn run-registered-hook
-  "Runs the registered command the way Claude Code does: through a shell with
-  the plugin root and project directory exported, from the given working
-  directory, hook JSON on stdin. env adds environment variables. Returns
-  stdout; a non-zero exit fails the test."
-  ([event lane project-root cwd input]
-   (run-registered-hook event lane project-root cwd input {}))
-  ([event lane project-root cwd input env]
-   (:out (p/shell {:dir (str cwd)
-                   :in (json/generate-string input)
-                   :out :string
-                   :extra-env (merge {"CLAUDE_PLUGIN_ROOT" (str repository-directory)
-                                      "CLAUDE_PROJECT_DIR" (str project-root)}
-                                     env)}
-                  "sh" "-c" (registered-command event lane)))))
+(defn mod-context
+  "The context entries the mod's entry script prints for the event, joined
+  into one string, or nil for none; a non-zero exit fails the test."
+  [kind project-root cwd input env]
+  (let [{:keys [exit out err]} (mod-result kind project-root cwd input env)]
+    (is (zero? exit) (str "mod entry exited " exit ": " err))
+    (let [{:keys [context]} (json/parse-string out true)]
+      (when (seq context)
+        (str/join "\n" context)))))
 
 (defn run-prompt-hook
-  "Lane 0 of the prompt hook, run from the project root."
+  "The prompt delivery, run from the project root: its context or nil."
   ([root session-id prompt]
    (run-prompt-hook root session-id prompt {}))
   ([root session-id prompt env]
-   (run-registered-hook :UserPromptSubmit 0 root root
-                        {:prompt prompt :session_id session-id}
-                        env)))
+   (mod-context "prompt" root root {:prompt prompt :session_id session-id} env)))
 
 (defn run-edit-hook
-  "Lane 0 of the edit hook, run from an unrelated working directory to show
-  the hook depends on CLAUDE_PROJECT_DIR and not on the cwd. A bare file
-  path is a file_path under root; otherwise the tool input and any extra
-  input fields are given as maps."
+  "The edit delivery, run from an unrelated working directory to show the
+  mod depends on CLAUDE_PROJECT_DIR and not on the cwd: its context or nil.
+  A bare file path is a file_path under root; otherwise the tool input and
+  any extra input fields are given as maps."
   ([root session-id file-path]
    (run-edit-hook root session-id {:file_path (str (io/file root file-path))} {}))
   ([root session-id tool-input extra-input]
-   (run-registered-hook :PreToolUse 0 root (System/getProperty "java.io.tmpdir")
-                        (merge {:session_id session-id :tool_input tool-input} extra-input))))
+   (mod-context "edit" root (System/getProperty "java.io.tmpdir")
+                (merge {:session_id session-id :tool_input tool-input} extra-input)
+                {})))
 
 (deftest subagent-and-mcp-edit-test
   (with-temp-project
     {".cursor/rules/widget.mdc" "---\nglobs: src/**\nalwaysApply: false\n---\n# Widget rule\n"
      "src/a.clj" ""}
     (fn [root]
-      (let [edit (fn [session-id tool-input extra-input]
-                   (some-> (run-edit-hook root session-id tool-input extra-input)
-                           not-empty
-                           (json/parse-string true)
-                           (get-in [:hookSpecificOutput :additionalContext])))
+      (let [edit #(run-edit-hook root %1 %2 %3)
             file (str (io/file root "src/a.clj"))]
         (testing "inside a subagent the hook injects nothing and records nothing"
           (is (nil? (edit "session-sub" {:file_path file} {:agent_id "agent-1" :agent_type "Explore"})))
@@ -496,35 +492,28 @@
   (apply p/shell {:dir (str root) :out :string :err :string}
          "git" "-c" "user.email=test@example.com" "-c" "user.name=Test" args))
 
+(defn shell-input
+  "The input of a shell delivery after a Bash call that succeeded
+  (:PostToolUse) or failed (:PostToolUseFailure), each call with its own
+  tool_use_id, as Claude Code's have, so each is its own event."
+  [event session-id]
+  {:session_id session-id
+   :hook_event_name (name event)
+   :tool_name "Bash"
+   :tool_use_id (str (random-uuid))
+   :tool_input {:command "printf x > somewhere"}})
+
 (defn shell-hook-result
-  "Lane 0 of the shell hook for a PostToolUse or PostToolUseFailure event of
-  the Bash tool, run from the project root: {:exit :out}, whatever the exit.
-  Each call carries its own tool_use_id, as Claude Code's do, so each is its
-  own hook event."
+  "The shell delivery for the event, run from the project root: {:exit :out
+  :err}, whatever the exit."
   [event root session-id]
-  (p/shell {:dir (str root)
-            :in (json/generate-string {:session_id session-id
-                                       :hook_event_name (name event)
-                                       :tool_name "Bash"
-                                       :tool_use_id (str (random-uuid))
-                                       :tool_input {:command "printf x > somewhere"}})
-            :out :string
-            :err :string
-            :continue true
-            :extra-env {"CLAUDE_PLUGIN_ROOT" (str repository-directory)
-                        "CLAUDE_PROJECT_DIR" (str root)}}
-           "sh" "-c" (registered-command event 0)))
+  (mod-result "shell" root root (shell-input event session-id)))
 
 (defn run-shell-hook
-  "The shell hook's additionalContext for the event, or nil; a non-zero exit
-  fails the test."
+  "The shell delivery's context for the event, or nil; a non-zero exit fails
+  the test."
   [event root session-id]
-  (let [{:keys [exit out]} (shell-hook-result event root session-id)]
-    (is (zero? exit) (str "shell hook exited " exit))
-    (when-not (str/blank? out)
-      (let [{:keys [hookSpecificOutput]} (json/parse-string out true)]
-        (is (= (name event) (:hookEventName hookSpecificOutput)) "the output names the event that ran")
-        (:additionalContext hookSpecificOutput)))))
+  (mod-context "shell" root root (shell-input event session-id) {}))
 
 (defn shell-pending [root session-id]
   (with-redefs [rule-common/state-dir (str (io/file root ".rule-fairy/claude"))]
@@ -637,9 +626,8 @@
           (is (not (str/includes? out "alwaysApply")))))
       (testing "a repeated prompt injects nothing"
         (is (str/blank? (run-prompt-hook root "session" "hello there"))))
-      (testing "the edit hook finds the project from CLAUDE_PROJECT_DIR, not the cwd"
-        (let [out (run-edit-hook root "session-edit" "src/a.clj")
-              context (get-in (json/parse-string out true) [:hookSpecificOutput :additionalContext])]
+      (testing "the edit delivery finds the project from CLAUDE_PROJECT_DIR, not the cwd"
+        (let [context (run-edit-hook root "session-edit" "src/a.clj")]
           (is (str/includes? context "[rule-fairy injected: widget.mdc]"))
           (is (str/includes? context "[rule-fairy matched: glob on src/a.clj]"))))
       (testing "state and caches land in the project's own state directory"
@@ -672,21 +660,13 @@
       (rule-common/save-session-state! "session" {:sizes {}})
       (is (= "*\n" (slurp (io/file rule-common/state-dir ".gitignore")))))))
 
-(deftest hook-lane-configuration-test
-  (let [settings (json/parse-string (slurp settings-file) true)]
-    (is (= "^Bash$" (get-in settings [:hooks :PostToolUse 0 :matcher])))
-    (is (= "^Bash$" (get-in settings [:hooks :PostToolUseFailure 0 :matcher])))
-    (doseq [[event script] [[:UserPromptSubmit "claude/prompt.bb"]
-                            [:PreToolUse "claude/edit.bb"]
-                            [:PostToolUse "claude/shell.bb"]
-                            [:PostToolUseFailure "claude/shell.bb"]]]
-      (let [handlers (get-in settings [:hooks event 0 :hooks])]
-        (is (= rule-common/hook-lane-count (count handlers)))
-        (is (= rule-common/hook-lane-count
-               (count (distinct (map #(select-keys % [:command :args]) handlers)))))
-        (is (= (set (range rule-common/hook-lane-count))
-               (set (map #(configured-hook-lane (:command %)) handlers))))
-        (is (every? #(str/ends-with? (:command %) script) handlers))))))
+(deftest mod-registration-test
+  (let [manifest (json/parse-string (slurp settings-file) true)]
+    (is (= ["./claude/register.ts"] (:modules manifest))
+        "the manifest names the mod's hooks module")
+    (is (nil? (:hooks manifest))
+        "no settings hooks remain beside it: the mod delivers every Claude Code event")
+    (is (.isFile (io/file repository-directory "hooks/claude/register.ts")))))
 
 (deftest injection-batch-test
   (with-temp-state
@@ -819,7 +799,7 @@
 (defn one-frame-per-rule
   "An injection-frames stand-in needing one frame per rule, the first frame
   carrying the prefix and the delivered rule names."
-  [rule-names prefix _delivery-id]
+  [rule-names prefix _delivery-id & _limits]
   (into [(str prefix "|" (str/join "," rule-names))]
         (repeat (dec (count rule-names)) "more")))
 
@@ -1009,6 +989,49 @@
                            "## Required context: `doc/conventions/test_conventions.md#given-when-then`"))
         (is (str/includes? rendered "Name each testing block by its phase."))
         (is (not (str/includes? rendered "not imported")))))))
+
+(defn mod-delivery
+  "One mod delivery of the named rules for the session, with the frames its
+  conversation already holds."
+  [event-id rule-names in-context-frames]
+  (rule-common/deliver!
+   {:session-id "session"
+    :event-id event-id
+    :transcript-metrics-fn (constantly current-metrics)
+    :selection-fn (fn []
+                    {:matching-rules rule-names
+                     :prefix-fn (fn [names]
+                                  (str/join "\n" (map #(str "[rule-fairy injected: " % "]") names)))})
+    :in-context-frames in-context-frames}))
+
+(deftest mod-delivery-test
+  (with-temp-rules
+    (merge (large-rule-files ["x" "y" "z"] 40)
+           {".cursor/rules/a.mdc" "---\nglobs: src/**\nalwaysApply: false\n---\n# A rule\n"
+            ".cursor/rules/b.mdc" "---\nglobs: src/**\nalwaysApply: false\n---\n# B rule\n"})
+    (fn [_]
+      (with-temp-state
+        (fn []
+          (testing "a session whose context already holds a rule's delivery, as after a fork, delivers only the rest"
+            (let [{:keys [context]} (mod-delivery "first" ["a.mdc" "b.mdc"]
+                                                  ["[rule-fairy shard 1/1 d1]\n[rule-fairy injected: a.mdc]"])]
+              (is (= 1 (count context)))
+              (is (str/includes? (first context) "[rule-fairy injected: b.mdc]"))
+              (is (str/includes? (first context) "# B rule"))
+              (is (not (str/includes? (first context) "# A rule")))
+              (is (= {"a.mdc" current-metrics "b.mdc" current-metrics}
+                     (:sizes (rule-common/load-session-state "session"))))))
+          (testing "the next event with the same rules delivers nothing"
+            (is (= {:context []} (mod-delivery "second" ["a.mdc" "b.mdc"] []))))))
+      (with-temp-state
+        (fn []
+          (testing "rules the lanes would split across frames arrive as one entry"
+            (let [{:keys [context]} (mod-delivery "large" ["x.mdc" "y.mdc" "z.mdc"] [])]
+              (is (= 1 (count context)))
+              (is (> (count (first context)) (* 3 rule-common/max-hook-context-chars)))
+              (is (str/starts-with? (first context) "[rule-fairy shard 1/1 "))
+              (is (= #{"x.mdc" "y.mdc" "z.mdc"}
+                     (set (keys (:sizes (rule-common/load-session-state "session")))))))))))))
 
 (deftest plugin-root-recorded-test
   (with-temp-project

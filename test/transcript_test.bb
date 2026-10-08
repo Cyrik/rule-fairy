@@ -131,6 +131,53 @@
 (defn injected [rule-name]
   (str "[rule-fairy injected: " rule-name "]"))
 
+(defn mod-record
+  "A transcript record of a mod hook's context, as Claude Code writes it:
+  every entry the hook attached, under :content as a list."
+  [hook-name & entries]
+  (json/generate-string {:type "attachment"
+                         :attachment {:type "hook_additional_context"
+                                      :hookName hook-name
+                                      :content (vec entries)}}))
+
+(deftest inherited-injections-from-mod-records-test
+  (with-transcript
+    (fn [file path]
+      (let [records (fn [& records] (spit file (str (str/join "\n" records) "\n")))
+            inherited #(transcript/inherited-injections path claude-pattern)]
+        (testing "a mod's prompt and tool deliveries are inherited like a settings hook's"
+          (records (mod-record "prompt.submit" (frame "d1" 1 1 (injected "a.mdc")))
+                   (mod-record "tool.call" (frame "d2" 1 1 (injected "b.mdc"))))
+          (is (= ["a.mdc" "b.mdc"] (inherited))))
+
+        (testing "one record carrying both entries of a delivery makes it whole"
+          (records (mod-record "prompt.submit"
+                               (frame "d1" 1 2 (injected "a.mdc"))
+                               (frame "d1" 2 2)))
+          (is (= ["a.mdc"] (inherited))))
+
+        (testing "a mod record after the last compaction summary counts, one before it does not"
+          (records (mod-record "prompt.submit" (frame "d1" 1 1 (injected "old.mdc")))
+                   (json/generate-string {:type "user" :isCompactSummary true})
+                   (mod-record "tool.call" (frame "d2" 1 1 (injected "new.mdc"))))
+          (is (= ["new.mdc"] (inherited))))
+
+        (testing "frames read back from the conversation follow the same rule, whole deliveries only"
+          (is (= ["a.mdc" "c.mdc"]
+                 (transcript/frames-injections
+                  [(frame "d1" 1 2 (injected "a.mdc"))
+                   "plain context without a header"
+                   (frame "d2" 1 2 (injected "b.mdc"))
+                   (frame "d1" 2 2)
+                   (frame "d3" 1 1 (injected "c.mdc"))]))))
+
+        (testing "a mod record whose content is not a list of frames is skipped"
+          (records (json/generate-string {:type "attachment"
+                                          :attachment {:type "hook_additional_context"
+                                                       :content "not a list"}})
+                   (mod-record "prompt.submit" "plain context without a header"))
+          (is (= [] (inherited))))))))
+
 (deftest inherited-injections-reads-whole-deliveries-only-test
   (with-transcript
     (fn [file path]

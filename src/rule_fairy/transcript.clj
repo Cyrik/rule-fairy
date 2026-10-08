@@ -62,28 +62,39 @@
 (def ^:private marker-pattern #"\[rule-fairy ([a-z]+): (.*)\]")
 
 (defn- hook-outputs
-  "The context texts a record delivered, when it is a hook_success
-  attachment: the attachment's content, where a prompt hook's output lands,
-  and the additionalContext inside its stdout JSON, where a tool hook's
-  lands. Empty for every other record. The substring test keeps JSON parsing
-  to the candidate lines, and another hook's stdout that is not JSON is
+  "The context texts a record delivered, when it is a hook attachment. A
+  hook_success attachment, a settings hook's record, delivers its content,
+  where a prompt hook's output lands, and the additionalContext inside its
+  stdout JSON, where a tool hook's lands. A hook_additional_context
+  attachment, a mod's record, delivers each entry of its content list.
+  Empty for every other record. The substring test keeps JSON parsing to
+  the candidate lines, and another hook's stdout that is not JSON is
   skipped."
   [line]
-  (if-not (str/includes? line "hook_success")
+  (if-not (or (str/includes? line "hook_success")
+              (str/includes? line "hook_additional_context"))
     []
-    (let [{:keys [type attachment]} (json/parse-string line true)]
-      (if-not (and (= "attachment" type)
-                   (= "hook_success" (:type attachment)))
+    (let [{:keys [type attachment]} (json/parse-string line true)
+          {:keys [content stdout]} attachment]
+      (cond
+        (not= "attachment" type)
         []
-        (let [{:keys [content stdout]} attachment
-              additional-context (when (and (string? stdout)
+
+        (= "hook_additional_context" (:type attachment))
+        (filter string? (when (sequential? content) content))
+
+        (= "hook_success" (:type attachment))
+        (let [additional-context (when (and (string? stdout)
                                             (str/starts-with? (str/triml stdout) "{"))
                                    (try
                                      (-> (json/parse-string stdout true)
                                          :hookSpecificOutput
                                          :additionalContext)
                                      (catch Exception _ nil)))]
-          (filter string? [content additional-context]))))))
+          (filter string? [content additional-context]))
+
+        :else
+        []))))
 
 (defn- shard-record
   "The frame a hook output is, as {:delivery id :shard i :shards n :injected
@@ -118,30 +129,40 @@
           rule-name (mapcat :injected shards)]
       rule-name)))
 
+(defn frames-injections
+  "Rule names the given hook outputs show as injected by Rule Fairy, in
+  first-appearance order. An output counts as a frame only when it opens
+  with a shard header naming its delivery, and a rule counts only when every
+  shard of its delivery is present among the outputs: a delivery cut short
+  was never marked where it ran and is not taken as delivered here. The mod
+  reads the outputs back from the conversation itself, in the Messages API
+  form `$.session.messages` answers, so what it finds is what the model's
+  context holds now, after any compaction."
+  [outputs]
+  (->> outputs
+       (keep shard-record)
+       whole-deliveries
+       distinct
+       vec))
+
 (defn inherited-injections
   "Rule names the complete records after the transcript's last compaction
   summary show as injected by Rule Fairy, in first-appearance order. A
   forked session's transcript replays the parent's hook outputs under the
   new session id and names the parent nowhere, so these records are the only
   trace of what the inherited context already holds. A frame counts only as
-  a hook_success attachment whose output opens with a shard header naming
-  its delivery, and a rule counts only when every shard of that delivery is
-  present: a delivery the parent lost lanes on was never marked there and is
-  not inherited here, so the fork delivers it whole. Reads the whole file
-  once, which the caller does once per session."
+  a hook attachment, a settings hook's hook_success or a mod's
+  hook_additional_context, whose output passes frames-injections. Reads the
+  whole file once, which the caller does once per session."
   [^Path path compaction-pattern]
   (let [content (slurp (.toFile path))
         complete (if-let [last-newline (str/last-index-of content "\n")]
                    (subs content 0 last-newline)
                    "")]
     (->> (str/split-lines complete)
-         (reduce (fn [records line]
+         (reduce (fn [outputs line]
                    (if (re-find compaction-pattern line)
                      []
-                     (if-let [record (some shard-record (hook-outputs line))]
-                       (conj records record)
-                       records)))
+                     (into outputs (hook-outputs line))))
                  [])
-         whole-deliveries
-         distinct
-         vec)))
+         frames-injections)))
