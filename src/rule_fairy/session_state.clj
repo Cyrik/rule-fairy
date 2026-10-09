@@ -1,23 +1,25 @@
 (ns rule-fairy.session-state
   "Per-session injection state shared by the harness adapters.
 
-  Each session has one EDN file under a harness-specific state directory. It
-  records, per rule, the transcript metrics at the moment the rule was last
-  injected (`:sizes`), how far the transcript has been scanned for
-  compaction records (`:transcript-scan`), and when the working tree was
-  last checked for files written through the shell (`:shell-check`, epoch
-  milliseconds; see `rule-fairy.changes`). A rule is injected again when the
-  transcript has been compacted since, or has grown by more than the
-  reinjection threshold, which also catches context cleanup that leaves no
-  compaction record. Files untouched for the TTL are deleted on the next save.
-  The directory ignores itself in git, so a consuming repository needs no
-  ignore rule.
+  Each session has one EDN file under a harness-specific state directory.
+  Both adapters record when the working tree was last checked for files
+  written through the shell (`:shell-check`, epoch milliseconds; see
+  `rule-fairy.changes`). The Codex adapter also records, per rule, the
+  transcript metrics at the moment the rule was last injected (`:sizes`)
+  and how far the transcript has been scanned for compaction records
+  (`:transcript-scan`): a rule is injected again when the transcript has
+  been compacted since, or has grown by more than the reinjection
+  threshold, which also catches context cleanup that leaves no compaction
+  record. The Claude Code adapter reads what the conversation holds instead
+  and records only when each rule was last delivered (`:delivered`). Files
+  untouched for the TTL are deleted on the next save. The directory ignores
+  itself in git, so a consuming repository needs no ignore rule.
 
   Both harnesses run several hook processes of one session at the same time
-  (Claude Code's lanes, Codex's concurrently launched hooks and subagents
-  carrying the parent's session id), so every read of a session's state, the
-  decision taken on it and the save that records it belong inside one
-  `with-lock` call."
+  (Claude Code's tool calls side by side, Codex's concurrently launched
+  hooks and subagents carrying the parent's session id), so every read of a
+  session's state, the decision taken on it and the save that records it
+  belong inside one `with-lock` call."
   (:require [babashka.fs :as fs]
             [clojure.edn :as edn]
             [clojure.java.io :as io]

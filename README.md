@@ -27,8 +27,8 @@ Cursor has `.cursor/rules/`. Rule Fairy exists for what they leave out:
   topics (`promptAnyOf`, `promptRequires`), not only when a file is touched.
 - **Firing on edits.** Claude Code's path-scoped rules load when a matching
   file is read, not when it is written or edited (anthropics/claude-code
-  #23478, #38487, #95083). Rule Fairy injects before an Edit or Write on
-  Claude Code and right after one on Codex.
+  #23478, #38487, #95083). Rule Fairy delivers the matching rules with the
+  result of an Edit or Write on Claude Code and right after one on Codex.
 - **Heading-level documentation imports.** `@doc/guide.md#section` pulls one
   section of a larger document into a rule; overlapping imports merge and
   `<!-- agent-context: omit -->` blocks stay out. Native imports take whole
@@ -37,8 +37,9 @@ Cursor has `.cursor/rules/`. Rule Fairy exists for what they leave out:
   documentation blocks, possibly in another shard.
 - **Reinjection after compaction.** After `/compact`, Claude Code re-injects
   only the root `CLAUDE.md`, and path-scoped rules return only when a
-  matching file is read again. Rule Fairy counts compactions per session and
-  delivers matched rules again.
+  matching file is read again. Rule Fairy reads what the conversation still
+  holds and delivers a matched rule again once a compaction has emptied it;
+  on Codex it counts compactions per session.
 - **Review against the rules.** Two skills check a diff or a plan against
   exactly the rules and instruction files that apply to the paths it touches,
   and report only what a rule supports.
@@ -50,7 +51,11 @@ runs your agent. The hooks look in `~/.local/bin`, `/opt/homebrew/bin` and
 `/usr/local/bin` as well, for agents launched from an editor or app with a
 minimal PATH.
 
-Claude Code, from GitHub or from a local checkout:
+Claude Code 2.1.287 or later, from GitHub or from a local checkout. The
+Claude Code side of the plugin is a mod, a module Claude Code loads in its
+own process; an older Claude Code loads no hooks from it and injects
+nothing, while the review skills still work. Rule Fairy 0.2.3 is the last
+version with the older settings hooks.
 
 ```sh
 claude plugin marketplace add Cyrik/rule-fairy   # or: claude plugin marketplace add ./rule-fairy
@@ -64,9 +69,11 @@ codex plugin marketplace add Cyrik/rule-fairy
 codex plugin add rule-fairy@rule-fairy
 ```
 
-Running sessions pick up hooks on restart. If the repository still registers
-the older project-local hooks in `.claude/settings.json` or `.codex/hooks.json`,
-remove them so rules are not injected twice.
+Running sessions pick up hooks on restart; a Claude Code session also picks
+up an install or update made from the shell after `/reload-plugins`. If the
+repository still registers the older project-local hooks in
+`.claude/settings.json` or `.codex/hooks.json`, remove them so rules are not
+injected twice.
 
 The review skills are `/rule-fairy:review` and `/rule-fairy:review-plan` in
 Claude Code and `$review` and `$review-plan` in Codex. Both also trigger from
@@ -76,48 +83,63 @@ request also needs the GitHub CLI (`gh`), logged in.
 
 ## How it works
 
-- **Prompt hook** (`UserPromptSubmit`, both harnesses): selects every
-  `alwaysApply` rule plus every rule whose `promptAnyOf` terms appear in the
-  prompt (all `promptRequires` terms must appear too), renders them with their
-  documentation imports, and injects them.
-- **Edit hook** (Claude `PreToolUse`, Codex `PostToolUse`): matches the edited
-  path against every rule's `globs` and injects the matches. On Codex the
-  injection stops the planned turn so the model considers the rules before
-  moving on.
-- **Shell hook** (Claude `PostToolUse` and `PostToolUseFailure` on `Bash`,
-  Codex `PostToolUse` on `Bash`): a shell command can write files no tool
-  input names, such as a heredoc, `sed -i` or `mv`. After the command the hook
-  asks git which files changed since the session's last shell check, matches
-  them against the globs and injects the rules with the post-edit contract:
-  apply them on the next pass, revise the change where it conflicts. The
-  check advances with every shell command and starts at the first prompt.
-  The check reads the working tree, so a commit, checkout, rebase or pull
-  that moves HEAD brings nothing, and a file written and committed in the
-  same command is not seen. A change stays pending until its rules have
-  reached the agent, so a rule that fails to build or a delivery cut short
-  is retried by the next command. On Claude Code, the injected
-  context names the changed paths that fit a 1,000-character budget and
-  counts the rest, so the prefix never exceeds the frame limit on its own.
-  Outside a git checkout nothing is detected. On by default for Claude Code and off for Codex; `:shell-hook`
+- **Prompt hook** (Claude `prompt.submit`, Codex `UserPromptSubmit`): selects
+  every `alwaysApply` rule plus every rule whose `promptAnyOf` terms appear in
+  the prompt (all `promptRequires` terms must appear too), renders them with
+  their documentation imports, and injects them with the prompt. On Claude
+  Code a prompt the person did not write, such as a background task's
+  report, another session's message or another plugin's prompt, selects
+  nothing: keyword rules match what the person asked.
+- **Edit hook** (Claude `tool.call` on Edit, Write, MultiEdit, NotebookEdit
+  and MCP edit tools, Codex `PostToolUse`): matches the edited path against
+  every rule's `globs` and injects the matches. On Claude Code the rules
+  arrive with the tool's result; on Codex the injection stops the planned
+  turn so the model considers the rules before moving on.
+- **Shell hook** (Claude `tool.call` on `Bash`, Codex `PostToolUse` on
+  `Bash`): a shell command can write files no tool input names, such as a
+  heredoc, `sed -i` or `mv`. After the command the hook asks git which files
+  changed since the session's last shell check, matches them against the
+  globs and injects the rules with the post-edit contract: apply them on the
+  next pass, revise the change where it conflicts. The check advances with
+  every shell command and starts at the first prompt. The check reads the
+  working tree, so a commit, checkout, rebase or pull that moves HEAD brings
+  nothing, and a file written and committed in the same command is not
+  seen. A change stays pending until its rules have reached the agent, so a
+  rule that fails to build or a delivery cut short is retried by the next
+  command. On Claude Code, the injected context names the changed paths
+  that fit a 1,000-character budget and counts the rest, so a rebase's
+  hundreds of paths stay one line. Outside a git checkout nothing is
+  detected. On by default for Claude Code and off for Codex; `:shell-hook`
   in `rule-fairy.edn` switches either (see Configuration).
-- **Dedup**: one state file per session records when each rule was injected.
-  A rule is injected again after a compaction, or after 2 MiB of transcript
-  growth as a fallback for silent context cleanup. A session whose
-  transcript already holds Rule Fairy injections it has no record of, as
-  after a fork, starts with those rules marked as injected, read from the
-  hook records after the last compaction summary; a delivery counts only
-  when every one of its shards, told apart by the delivery id in the shard
-  header, is recorded. State lives under
-  `.rule-fairy/<harness>/` in the project and ignores itself in git.
-- **Bounded delivery**: Claude Code truncates hook output over 10,000
-  characters (anthropics/claude-code#94358, not configurable), so the Claude
-  hooks register 12 lanes per event and split one injection across them.
-  A matched set that needs more frames than there are lanes, or more
-  documentation than the 64 KiB budget, is delivered in match order as far
-  as it fits; the first shard names the rest, which comes with the next
-  event that matches it. A single rule too large for either is reported and
-  never marked. Codex caps `additionalContext` at 2,500
-  tokens by default; the registration sets `additionalContextLimit` to 0.
+- **Dedup**: on Claude Code a rule is delivered when no whole delivery of it
+  is in the conversation the model holds, read at each event, and none was
+  delivered in the last minute, which covers tool calls that run side by
+  side. A compaction empties the conversation of past deliveries, so the
+  next matching event delivers again; a forked session starts with what it
+  inherited; no transcript file is read. A delivery counts only when every
+  one of its entries, told apart by the delivery id in the shard header, is
+  present. On Codex one state file per session records the transcript
+  metrics at each injection, and a rule is injected again after a
+  compaction or after 2 MiB of transcript growth as a fallback for silent
+  context cleanup. State lives under `.rule-fairy/<harness>/` in the project
+  and ignores itself in git.
+- **Bounded delivery**: on Claude Code one delivery is at most two context
+  entries of 100,000 characters each, which the model reads whole; a
+  settings hook's output is cut at 10,000 characters
+  (anthropics/claude-code#94358), which is why the Claude Code side is a mod.
+  A matched set that needs more entries than that, or more documentation
+  than the 64 KiB budget, is delivered in match order as far as it fits; the
+  first entry names the rest, which comes with the next event that matches
+  it. A single rule too large for either is reported and never recorded.
+  Codex caps `additionalContext` at 2,500 tokens by default; the
+  registration sets `additionalContextLimit` to 0.
+- **Failures are visible**: on Claude Code a delivery that fails, its
+  process exiting non-zero or the hook itself throwing or timing out,
+  attaches one error entry naming the failure and logs a line to the
+  transcript, so the model and the person both see it, and the prompt or
+  tool goes on as if unhooked. Once a prompt has entered the session no
+  context can attach any more, so a failure after that point is logged
+  only.
 - **Review skill** (`rule-fairy:review`, both harnesses): fetches a diff (a
   pull request through `gh`, uncommitted work, or a branch against its base),
   builds a bundle of the instruction files, rules and documentation that apply
@@ -145,14 +167,18 @@ request also needs the GitHub CLI (`gh`), logged in.
   marketplace for both harnesses. The three files carry the same version,
   bumped with every push meant for installed users, because Claude Code's
   `plugin update` acts only on a version change.
-- `hooks/hooks.json`, `hooks/codex-hooks.json`: hook registrations. Every
-  command runs `hooks/run`, a small shell wrapper that finds the plugin root,
-  hands it to the script as `RULE_FAIRY_PLUGIN_ROOT`, makes sure `bb` is on
-  the PATH, and starts Babashka with the plugin's own `bb.edn` so a consuming
-  repository's `bb.edn` never reaches the classpath.
-- `hooks/claude/`: `common.bb` (project root, session state, lane batching,
-  the glob cache, shell-change detection), `prompt.bb`, `edit.bb`,
-  `shell.bb`, and `common_test.bb`.
+- `hooks/hooks.json`, `hooks/codex-hooks.json`: the Claude Code hooks
+  manifest names the mod's module; the Codex one registers commands. Every
+  process the hooks start runs `hooks/run`, a small shell wrapper that finds
+  the plugin root, hands it to the script as `RULE_FAIRY_PLUGIN_ROOT`, makes
+  sure `bb` is on the PATH, and starts Babashka with the plugin's own
+  `bb.edn` so a consuming repository's `bb.edn` never reaches the classpath.
+- `hooks/claude/`: `register.ts`, the mod, one in-process hook per event
+  that runs `mod.bb` once per delivery and attaches what it prints;
+  `mod.bb`, the entry point, which selects the rules for a prompt, an edit
+  or a shell command; `common.bb` (project root, session state, the
+  delivery, the glob cache, shell-change detection); `common_test.bb`; and
+  `register.test.ts`, the mod's tests under `claude plugin test`.
 - `hooks/codex/`: `common.bb`, `prompt.bb`, `post_edit.bb` (edits and shell
   commands alike), and `common_test.bb`. The adapters intentionally have
   different delivery contracts.
@@ -167,9 +193,12 @@ request also needs the GitHub CLI (`gh`), logged in.
   one copy per real file. `src/rule_fairy/dedup.clj`: section and paragraph
   deduplication across a bundle, each omission replaced by a line naming the
   kept copy.
-- `src/rule_fairy/session_state.clj`: per-session dedup state shared by the
-  adapters, including the shell-check marker. `src/rule_fairy/transcript.clj`:
-  incremental compaction counting with a scan cursor.
+- `src/rule_fairy/session_state.clj`: per-session state shared by the
+  adapters: the shell-check marker and pending paths for both, Codex's
+  transcript metrics, Claude Code's delivery times.
+  `src/rule_fairy/transcript.clj`: incremental compaction counting with a
+  scan cursor for Codex, and the reader that names the rules the whole
+  deliveries among a set of frames injected, for Claude Code.
   `src/rule_fairy/changes.clj`: the files changed in a checkout since a
   moment, from `git status` plus modification and inode change times, which
   is how the shell hook finds what a command wrote.
@@ -268,8 +297,7 @@ ignoring its own content, so nothing needs to be added to the repository's
 ignore rules. The hooks also record the directory the plugin runs from in
 `.rule-fairy/<harness>/plugin-root`, one absolute path on one line, for a
 skill of the project that wants the plugin's review scripts (see Using the
-review from another skill). The Claude registration sets `RULE_FAIRY_LANE`
-per hook entry.
+review from another skill).
 
 Context injected by the hooks is labelled `[rule-fairy injected: <rule>]`,
 `[rule-fairy matched: alwaysApply ...]`, `[rule-fairy matched: keyword ...]`,
@@ -314,21 +342,28 @@ report.
 bb test
 ```
 
-Runs fifteen suites: engine, Markdown, instruction files, dedup, bundle,
-git, plan, transcript, session state, Claude hooks, Codex hooks, the two
-skills' scripts and the plugin layout. Every suite builds its rules,
-documents, and state in temporary directories; the git and review script
-suites build real repositories, the latter with a branch, uncommitted and
-untracked changes, and a fake `gh` on the PATH.
-The hook suites also run the registered commands from `hooks/hooks.json` and
-`hooks/codex-hooks.json` through a shell against a temporary project, the way
-the harnesses do, with a broken `bb.edn` planted in that project to prove it
-does not affect the hooks. The Claude lane test reads
-`RULE_FAIRY_SETTINGS_FILE` to validate another registration file. The skill
-script suites run each skill's `scripts/run` shim as a subprocess, the way
-the skill text tells an agent to. The layout suite checks that every skill
-and agent file carries the frontmatter both harnesses need and that the files
-the skill text names exist.
+Runs fifteen Babashka suites: engine, Markdown, instruction files, dedup,
+bundle, git, plan, transcript, session state, Claude hooks, Codex hooks, the
+two skills' scripts and the plugin layout, then the mod's TypeScript tests
+through `claude plugin test` where Claude Code is installed. Every suite
+builds its rules, documents, and state in temporary directories; the git
+and review script suites build real repositories, the latter with a branch,
+uncommitted and untracked changes, and a fake `gh` on the PATH.
+The Claude hook suite runs `mod.bb` through `hooks/run` against a temporary
+project, the way the mod does, and the Codex suite runs the registered
+commands from `hooks/codex-hooks.json` through a shell, with a broken
+`bb.edn` planted in the project to prove it does not affect the hooks. The
+registration test reads `RULE_FAIRY_SETTINGS_FILE` to validate another
+hooks manifest. The mod's tests answer its session, process and log calls
+from the test, so no Babashka runs there. The skill script suites run each
+skill's `scripts/run` shim as a subprocess, the way the skill text tells an
+agent to. The layout suite checks that every skill and agent file carries
+the frontmatter both harnesses need and that the files the skill text names
+exist. `claude plugin validate .` lists the mod's hooks and the calls it
+makes. Loading the plugin once with `claude --plugin-dir .` makes Claude
+Code write its type declarations under `.claude-plugin/types/`, and
+`bunx tsc -p tsconfig.json --noEmit` then type-checks the module and its
+tests against them.
 
 ## Design decisions
 
@@ -346,9 +381,12 @@ the skill text names exist.
   and delivered through the normal session dedup, so they arrive with the
   first prompt and return after compaction. Consuming repositories should not
   duplicate that content in `CLAUDE.md` or `AGENTS.md`.
-- Transcript metrics are read incrementally. The session state keeps a scan
-  cursor and each event counts only the complete lines appended since, so the
-  per-prompt cost of the reinjection check no longer grows with the session.
+- On Codex, transcript metrics are read incrementally. The session state
+  keeps a scan cursor and each event counts only the complete lines appended
+  since, so the per-prompt cost of the reinjection check does not grow with
+  the session. Claude Code reads no transcript: the mod reads the
+  conversation the model holds, which is the question the metrics
+  approximated.
 - Each harness keeps one dedup map per session shared by all of its hooks. A
   rule delivered after an edit is not delivered again by the next prompt, and
   the reverse. Codex previously kept separate prompt and post-edit buckets.
@@ -357,13 +395,17 @@ the skill text names exist.
   only where that format is meant. The rules location is configuration, not
   identity: `.cursor/rules/**/*.mdc` stays the default because Cursor requires
   it and Claude Code's `/init` already recognises it.
-- Preserve Claude's distinct lane identities, one-time batch rendering, and
-  acknowledgement only after each output is written and flushed. The full
-  matched-rule marker need not appear at the end or on every shard.
+- The Claude Code adapter is a mod: one in-process hook per event, one
+  Babashka process per delivery, context entries of up to 100,000
+  characters. The settings hooks it replaced were cut at 10,000 characters
+  and needed twelve lanes per event, a batch protocol and completion
+  markers to deliver one injection; the bugs that design produced were
+  consequences of the cap. The Codex adapter keeps its settings hooks, whose
+  cap is configurable.
 - Every hook updates its session's state under a per-session file lock.
-  Claude Code runs the twelve lanes of one event at once; Codex launches the
-  hooks matching an event concurrently and runs a subagent's hooks under the
-  parent's session id.
+  Claude Code runs tool calls, and so their hooks, side by side; Codex
+  launches the hooks matching an event concurrently and runs a subagent's
+  hooks under the parent's session id.
 - An edited path is matched the way the project's globs are written: relative
   to the checkout that holds the file, less the project's own position in its
   checkout. A session started in a subdirectory of a repository keeps its
@@ -398,17 +440,20 @@ the skill text names exist.
   `rules-revision` follow it. One helper answers where a path lies for all
   of the inputs, so a new layout is judged against the contract rather than
   given a case of its own.
-- Preserve explicit compaction detection and the 2 MiB transcript-growth
-  reinjection fallback. The fallback addresses silent context cleanup as well
-  as ordinary compaction; removing it needs separate investigation.
+- On Codex, preserve explicit compaction detection and the 2 MiB
+  transcript-growth reinjection fallback, which addresses silent context
+  cleanup as well as ordinary compaction. On Claude Code both went with the
+  move to the mod: the conversation read says exactly what the model holds,
+  and the growth fallback had been observed re-sending rules that were still
+  in context.
 - Keep normal project skills, commands, and unrelated hooks enabled. Installing
   the plugin must not depend on excluding the project settings source.
 - Replace the old hook registrations during migration to prevent double firing.
 - Register every Codex Rule Fairy hook with `additionalContextLimit: 0`. Codex caps
   `additionalContext` at 2,500 tokens by default and replaces larger output
   with a head-and-tail preview plus a file path, the same silent truncation
-  the Claude lanes work around. The Codex adapter renders one unsharded
-  bundle, so the cap must be lifted per hook. The engine's 64 KiB documentation
+  Claude Code applies to a settings hook's output. The Codex adapter renders
+  one unsharded bundle, so the cap must be lifted per hook. The engine's 64 KiB documentation
   budget remains the size guard. Codex documents the limit only for
   `additionalContext`; whether the `continue: false` replacement path honours
   it is unstated and needs a live check.
@@ -441,9 +486,18 @@ the skill text names exist.
   the git check proves too slow somewhere. Inside git, a file another
   session changes between two shell checks is attributed to this session and
   gets its rules once, which is harmless.
-- **Lane order.** The twelve Claude Code hook lanes of one event arrive in
-  the transcript in arrival order, so a rule split across shards can read out
-  of sequence. The shard labels let the model reassemble it.
+- **Where the mod cannot load, nothing is injected on Claude Code.** The
+  module needs Claude Code 2.1.287; on an older version it does not load
+  while the review skills work. `disableAllHooks` stops the module and
+  every settings hook and leaves the skills. `--safe-mode` disables the
+  whole plugin, skills included. An organisation's `allowManagedModsOnly`
+  policy stops the module alone: settings hooks keep running, the skills
+  load. `claude plugin test`, run from a directory without a mod, says
+  whether mods can load at all but does not report that policy; its
+  refusal shows in the debug log.
+- **The conversation read is bounded.** The mod reads the newest 4,096
+  entries of the conversation, so a rule delivered further back than that,
+  in a session that never compacted, is delivered again.
 
 ## License
 

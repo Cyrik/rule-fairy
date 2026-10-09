@@ -1,7 +1,8 @@
 {:paths ["src"]
  :tasks
- {:requires ([babashka.process :as p])
-  test {:doc "Run every suite: engine, Markdown, instruction files, dedup, bundle, git, plan, transcript, session state, Claude hooks, Codex hooks, review and review-plan skill scripts, plugin layout."
+ {:requires ([babashka.fs :as fs]
+             [babashka.process :as p])
+  test {:doc "Run every suite: engine, Markdown, instruction files, dedup, bundle, git, plan, transcript, session state, Claude hooks, Codex hooks, review and review-plan skill scripts, plugin layout, and the Claude Code mod's TypeScript tests (claude plugin test) where Claude Code is installed."
         :task (let [suites ["test/rules_test.bb"
                             "test/markdown_test.bb"
                             "test/instructions_test.bb"
@@ -19,7 +20,13 @@
                             "test/plugin_layout_test.bb"]
                     failed (vec (filter (fn [suite]
                                           (pos? (:exit (p/shell {:continue true} "bb" suite))))
-                                        suites))]
+                                        suites))
+                    failed (if (fs/which "claude")
+                             (cond-> failed
+                               (pos? (:exit (p/shell {:continue true} "claude" "plugin" "test" ".")))
+                               (conj "claude plugin test"))
+                             (do (println "claude is not installed: the mod's TypeScript tests (claude plugin test) were skipped")
+                                 failed))]
                 (when (seq failed)
                   (println "Failed suites:" (pr-str failed))
                   (System/exit (count failed))))}}}

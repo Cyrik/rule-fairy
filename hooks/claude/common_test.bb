@@ -17,22 +17,55 @@
       (str (io/file repository-directory "hooks/hooks.json"))))
 
 (load-file (str (io/file hooks-directory "common.bb")))
-(binding [*in* (java.io.StringReader. "")]
-  (load-file (str (io/file hooks-directory "edit.bb"))))
 
 (def rule-name "testing.mdc")
-(def current-metrics {:size 100 :compaction-count 0})
 
 (defn test-selection []
   {:matching-rules [rule-name]
    :prefix-fn (constantly "prefix")})
 
-(defn test-frame-request [lane-index]
-  {:session-id "session"
-   :event-id "event"
-   :lane-index lane-index
-   :transcript-metrics-fn (constantly current-metrics)
-   :selection-fn test-selection})
+(defn delivery
+  "deliver! for the session: the selection's rules, with in-context-frames
+  the frames the conversation holds, none unless given, at now-ms, the
+  current time unless given."
+  ([event-id selection-fn]
+   (delivery event-id selection-fn []))
+  ([event-id selection-fn in-context-frames]
+   (delivery event-id selection-fn in-context-frames nil))
+  ([event-id selection-fn in-context-frames now-ms]
+   (rule-common/deliver! (cond-> {:session-id "session"
+                                  :event-id event-id
+                                  :selection-fn selection-fn
+                                  :in-context-frames in-context-frames}
+                           now-ms (assoc :now-ms now-ms)))))
+
+(defn delivered-rules
+  "The rules the session state records as delivered."
+  []
+  (set (keys (:delivered (rule-common/load-session-state "session")))))
+
+(defn in-context
+  "Frames of whole single-shard deliveries of the named rules, as the mod
+  reads them back from the conversation."
+  [& rule-names]
+  (mapv #(str "[rule-fairy shard 1/1 " % "]\n[rule-fairy injected: " % "]\n\n# body") rule-names))
+
+(defn naming-selection
+  "A selection of the named rules whose first frame opens by naming the
+  delivered ones as injected."
+  [rule-names]
+  (fn []
+    {:matching-rules rule-names
+     :prefix-fn (fn [names]
+                  (str/join "\n" (map #(str "[rule-fairy injected: " % "]") names)))}))
+
+(defn shell-selection
+  "A selection whose delivery clears the pending shell paths."
+  [paths matching-rules]
+  (fn []
+    {:matching-rules matching-rules
+     :prefix-fn (constantly "prefix")
+     :paths paths}))
 
 (defn with-temp-project [files f]
   (let [root (.toFile
@@ -141,70 +174,6 @@
                (rule-common/relative-file-path (.getAbsolutePath (io/file root "repo/backend"))
                                                (.getAbsolutePath (io/file root "repo/backend/src/a.clj")))))))))
 
-(deftest reinjection-test
-  (testing "when a rule has not been injected, then it needs injection"
-    (is (rule-common/needs-reinjection? {} rule-name
-                                       {:size 100 :compaction-count 0})))
-
-  (testing "given a rule was injected in the current context generation"
-    (let [state {:sizes {rule-name {:size 100 :compaction-count 1}}}]
-      (testing "when little transcript growth has occurred, then it stays deduplicated"
-        (is (not (rule-common/needs-reinjection? state rule-name
-                                                {:size 101 :compaction-count 1}))))
-
-      (testing "when the transcript grows by the threshold, then it needs reinjection"
-        (is (rule-common/needs-reinjection?
-             state rule-name
-             {:size (+ 100 rule-common/reinjection-threshold-bytes)
-              :compaction-count 1})))
-
-      (testing "when the context is compacted, then it needs immediate reinjection"
-        (is (rule-common/needs-reinjection? state rule-name
-                                           {:size 101 :compaction-count 2})))))
-
-  (testing "given legacy numeric state"
-    (testing "when the transcript has compacted, then it needs reinjection"
-      (is (rule-common/needs-reinjection? {:sizes {rule-name 100}}
-                                         rule-name
-                                         {:size 101 :compaction-count 1})))))
-
-(deftest transcript-metrics-test
-  (with-temp-project
-    {"-Users-example-Workspace-project/session.jsonl"
-     (str "{\"type\":\"user\",\"isCompactSummary\":false}\n"
-          "{\"type\":\"user\",\"isCompactSummary\":true}\n")}
-    (fn [root]
-      (with-temp-state
-        (fn []
-          (with-redefs [rule-common/claude-projects-dir (.getAbsolutePath root)]
-            (let [transcript (io/file root "-Users-example-Workspace-project/session.jsonl")]
-              (testing "the transcript is found by session id and scanned once in full"
-                (is (= {:size (.length transcript) :compaction-count 1}
-                       (rule-common/transcript-metrics! "session")))
-                (is (= {:scanned-bytes (.length transcript) :compaction-count 1}
-                       (:transcript-scan (rule-common/load-session-state "session")))))
-              (testing "a later call counts only the appended complete lines"
-                (spit transcript
-                      (str "{\"type\":\"user\",\"isCompactSummary\":true}\n"
-                           "{\"type\":\"user\",\"isCompactSum")
-                      :append true)
-                (is (= {:size (.length transcript) :compaction-count 2}
-                       (rule-common/transcript-metrics! "session")))
-                (is (< (get-in (rule-common/load-session-state "session")
-                               [:transcript-scan :scanned-bytes])
-                       (.length transcript))))
-              (testing "marking rules injected keeps the scan cursor"
-                (rule-common/mark-injected! "session"
-                                           (rule-common/load-session-state "session")
-                                           [rule-name]
-                                           current-metrics)
-                (is (= 2 (get-in (rule-common/load-session-state "session")
-                                 [:transcript-scan :compaction-count])))
-                (is (= current-metrics
-                       (get-in (rule-common/load-session-state "session") [:sizes rule-name]))))
-              (testing "an unknown session has no transcript and no metrics"
-                (is (nil? (rule-common/transcript-metrics! "missing-session")))))))))))
-
 (deftest event-id-test
   (is (= (rule-common/event-id :prompt "input")
          (rule-common/event-id :prompt "input")))
@@ -256,11 +225,13 @@
              "doc/guide.md"
              "# Guide\n\n## Shared\n\nshared guidance\n\n## Other\n\nnot imported\n")
       (fn [_]
-        (let [frames (rule-common/injection-frames rule-names "[rule-fairy matched: test]" "delivery")
+        ;; A frame limit small enough to split four 9 KB rules, so the
+        ;; packer meets real headings, paragraphs and fences.
+        (let [frames (with-redefs [rule-common/max-frame-chars 9000]
+                       (rule-common/injection-frames rule-names "[rule-fairy matched: test]" "delivery"))
               joined (str/join "\n" frames)]
           (is (< 1 (count frames)))
-          (is (<= (count frames) rule-common/hook-lane-count))
-          (is (every? #(<= (count %) rule-common/max-hook-context-chars) frames))
+          (is (every? #(<= (count %) 9000) frames))
           (is (every? #(str/starts-with? % "[rule-fairy shard") frames))
           (is (= 1 (count (filter #(str/includes? % "[rule-fairy matched: test]") frames))))
           (doseq [rule-name rule-stems]
@@ -271,86 +242,18 @@
             (is (= 1 (count (re-seq #"shared guidance" joined))))
             (is (not (str/includes? joined "not imported")))))))))
 
-(deftest large-matched-rule-set-fits-configured-lanes-test
-  (let [rule-stems (mapv #(str "rule-" %) (range 8))
-        rule-names (mapv #(str % ".mdc") rule-stems)]
-    (with-temp-rules
-      (large-rule-files rule-stems 30)
-      (fn [_]
-        (let [prefix (str (str/join "\n" (map #(str "[rule-fairy injected: " % "]") rule-names))
-                          "\n[rule-fairy matched: glob on apps/example/src/example/ui/example.clj]")
-              frames (rule-common/injection-frames rule-names prefix "delivery")]
-          (is (<= (count frames) rule-common/hook-lane-count))
-          (is (every? #(<= (count %) rule-common/max-hook-context-chars) frames))
-          (is (= 1 (count (filter #(str/includes? % "[rule-fairy injected:") frames))))
-          (is (every? #(str/starts-with? % "[rule-fairy shard") frames)))))))
-
-(deftest lanes-deliver-rendered-rules-end-to-end-test
-  (let [rule-stems ["alpha" "beta" "gamma"]
-        rule-names (mapv #(str % ".mdc") rule-stems)]
-    (with-temp-rules
-      (large-rule-files rule-stems 30)
-      (fn [_]
-        (with-temp-state
-          (fn []
-            (let [request (fn [lane-index]
-                            {:session-id "session"
-                             :event-id "event"
-                             :lane-index lane-index
-                             :transcript-metrics-fn (constantly current-metrics)
-                             :selection-fn
-                             (fn []
-                               {:matching-rules rule-names
-                                :prefix-fn
-                                (fn [names]
-                                  (str/join "\n" (map #(str "[rule-fairy injected: " % "]")
-                                                      names)))})})
-                  deliveries (->> (range rule-common/hook-lane-count)
-                                  (keep #(rule-common/injection-frame-for-lane!
-                                          (request %)))
-                                  vec)
-                  joined (str/join "\n" (map :frame deliveries))]
-              (is (< 1 (count deliveries)))
-              (is (= (range (count deliveries)) (map :frame-index deliveries)))
-              (doseq [rule-name rule-stems]
-                (testing rule-name
-                  (is (str/includes? joined (rule-paragraph rule-name 29)))))
-              (is (= {:sizes {}} (rule-common/load-session-state "session")))
-              (doseq [{:keys [frame-index]} deliveries]
-                (rule-common/complete-injection-frame! "session" "event" frame-index))
-              (is (= (zipmap rule-names (repeat current-metrics))
-                     (:sizes (rule-common/load-session-state "session"))))
-              (is (nil? (rule-common/injection-frame-for-lane! (request 0)))))))))))
-
 (deftest partial-delivery-with-real-frames-reads-back-as-what-it-delivered-test
   (let [rule-stems ["alpha" "beta" "gamma"]
-        rule-names (mapv #(str % ".mdc") rule-stems)
-        hook-record (fn [output-key output]
-                      (json/generate-string {:type "attachment"
-                                             :attachment {:type "hook_success" output-key output}}))
-        tool-output (fn [frame] (json/generate-string {:hookSpecificOutput {:additionalContext frame}}))]
+        rule-names (mapv #(str % ".mdc") rule-stems)]
     (with-temp-rules
       (large-rule-files rule-stems 40)
       (fn [_]
         (with-temp-state
           (fn []
-            (with-redefs [rule-common/hook-lane-count 2]
-              (let [request (fn [lane-index]
-                              {:session-id "session"
-                               :event-id "event"
-                               :lane-index lane-index
-                               :transcript-metrics-fn (constantly current-metrics)
-                               :selection-fn
-                               (fn []
-                                 {:matching-rules rule-names
-                                  :prefix-fn (fn [names]
-                                               (str/join "\n" (map #(str "[rule-fairy injected: " % "]") names)))})})
-                    deliveries (->> (range rule-common/hook-lane-count)
-                                    (keep #(rule-common/injection-frame-for-lane! (request %)))
-                                    vec)
-                    frames (mapv :frame deliveries)
+            (with-redefs [rule-common/max-frame-chars 9000]
+              (let [{frames :context} (delivery "event" (naming-selection rule-names))
                     [header deferred-line injected-line] (str/split-lines (first frames))]
-                (testing "three 12 KB rules in two lanes: the first rule in two frames, the other two deferred"
+                (testing "three 12 KB rules under a 9,000-character frame limit: the first rule in two frames, the other two deferred"
                   (is (= 2 (count frames)))
                   (is (= "[rule-fairy shard 1/2 event]" header)
                       "the header carries the delivery id, the leading part of the event id")
@@ -358,42 +261,20 @@
                          deferred-line))
                   (is (= "[rule-fairy injected: alpha.mdc]" injected-line))
                   (is (str/starts-with? (second frames) "[rule-fairy shard 2/2 event]\n")))
-                (testing "the fork reader returns the delivered rule from the real frames, whichever shape the hook wrote"
-                  (with-temp-project
-                    {"whole.jsonl" (str (hook-record :content (first frames)) "\n"
-                                        (hook-record :stdout (tool-output (second frames))) "\n")
-                     "cut-short.jsonl" (str (hook-record :content (first frames)) "\n")}
-                    (fn [root]
-                      (let [inherited #(rule-fairy.transcript/inherited-injections
-                                        (.toPath (io/file root %))
-                                        @#'rule-common/compaction-pattern)]
-                        (is (= ["alpha.mdc"] (inherited "whole.jsonl")))
-                        (is (= [] (inherited "cut-short.jsonl"))
-                            "a delivery missing its second shard is not inherited")))))
-                (testing "only the delivered rule is marked once both lanes acknowledge"
-                  (doseq [{:keys [frame-index]} deliveries]
-                    (rule-common/complete-injection-frame! "session" "event" frame-index))
-                  (is (= {"alpha.mdc" current-metrics}
-                         (:sizes (rule-common/load-session-state "session")))))))))))))
+                (testing "only the delivered rule is recorded"
+                  (is (= #{"alpha.mdc"} (delivered-rules))))
+                (testing "the conversation reader returns the delivered rule from the real frames, and nothing from a delivery cut short"
+                  (is (= ["alpha.mdc"] (rule-fairy.transcript/frames-injections frames)))
+                  (is (= [] (rule-fairy.transcript/frames-injections [(first frames)]))
+                      "a delivery missing its second frame is not counted"))))))))))
 
 (deftest documentation-budget-is-part-of-what-fits-test
   (let [paragraphs (fn [heading n]
                      (str/join "\n\n" (map #(str heading " paragraph " % ": " (apply str (repeat 960 "d"))) (range n))))
         section (fn [heading] (str "## " heading "\n\n" (paragraphs heading 20)))
         rule (fn [heading] (str "---\nglobs: apps/**/*.clj\nalwaysApply: false\n---\n# " heading "\n\n@doc/guide.md#" heading "\n"))
-        request (fn [lane-index matching-rules]
-                  {:session-id "session"
-                   :event-id (str/join "-" matching-rules)
-                   :lane-index lane-index
-                   :transcript-metrics-fn (constantly current-metrics)
-                   :selection-fn (fn []
-                                   {:matching-rules matching-rules
-                                    :prefix-fn (fn [names]
-                                                 (str/join "\n" (map #(str "[rule-fairy injected: " % "]") names)))})})
         deliveries (fn [matching-rules]
-                     (->> (range rule-common/hook-lane-count)
-                          (keep #(rule-common/injection-frame-for-lane! (request % matching-rules)))
-                          vec))]
+                     (:context (delivery (str/join "-" matching-rules) (naming-selection matching-rules))))]
     (with-temp-rules
       {"doc/guide.md" (str "# Guide\n\n" (str/join "\n\n" (map section ["one" "two" "three" "four"]))
                            "\n\n## big\n\n" (paragraphs "big" 70))
@@ -406,23 +287,19 @@
         (with-temp-state
           (fn []
             (testing "four rules whose documentation together passes 64 KiB: three delivered, the fourth deferred"
-              (let [delivered (deliveries ["a.mdc" "b.mdc" "c.mdc" "d.mdc"])
-                    first-frame (:frame (first delivered))]
-                (is (<= 2 (count delivered) rule-common/hook-lane-count))
+              (let [[first-frame :as delivered] (deliveries ["a.mdc" "b.mdc" "c.mdc" "d.mdc"])]
+                (is (<= 1 (count delivered) rule-common/max-frames-per-delivery))
                 (is (str/includes? first-frame "[rule-fairy deferred: d.mdc (past what one delivery can carry; delivered with the next matching event)]"))
                 (is (str/includes? first-frame "[rule-fairy injected: c.mdc]"))
                 (is (not (str/includes? first-frame "[rule-fairy injected: d.mdc]")))
-                (doseq [{:keys [frame-index]} delivered]
-                  (rule-common/complete-injection-frame! "session" "a.mdc-b.mdc-c.mdc-d.mdc" frame-index))
-                (is (= {"a.mdc" current-metrics "b.mdc" current-metrics "c.mdc" current-metrics}
-                       (:sizes (rule-common/load-session-state "session"))))))
+                (is (= #{"a.mdc" "b.mdc" "c.mdc"} (delivered-rules)))))
             (testing "a single rule whose documentation alone passes the budget is reported, not marked"
-              (let [{:keys [frame frame-index]} (first (deliveries ["e.mdc"]))]
+              (let [[frame :as delivered] (deliveries ["e.mdc"])]
+                (is (= 1 (count delivered)))
                 (is (str/includes? frame "[rule-fairy error: e.mdc alone expands to "))
                 (is (str/includes? frame " bytes of documentation, over the 65536-byte budget]"))
                 (is (str/includes? frame "No matched rules were injected"))
-                (rule-common/complete-injection-frame! "session" "e.mdc" frame-index)
-                (is (not (contains? (:sizes (rule-common/load-session-state "session")) "e.mdc")))))))))))
+                (is (not (contains? (delivered-rules) "e.mdc")))))))))))
 
 (defn mod-result
   "Runs the mod's entry script the way hooks/claude/register.ts does: through
@@ -635,29 +512,10 @@
         (is (.isFile (io/file root ".rule-fairy/claude/globs-cache.edn")))
         (is (.isFile (io/file root ".rule-fairy/claude/session.edn")))))))
 
-(deftest relocated-config-dir-test
-  (with-temp-project
-    {".cursor/rules/base.mdc"
-     "---\ndescription: Base\nalwaysApply: true\n---\n# Base rule\n"
-     "config/projects/-Users-example-project/session-relocated.jsonl"
-     "{\"type\":\"user\",\"isCompactSummary\":true}\n"}
-    (fn [root]
-      (let [env {"CLAUDE_CONFIG_DIR" (str (io/file root "config"))}
-            transcript (io/file root "config/projects/-Users-example-project/session-relocated.jsonl")]
-        (testing "the transcript is found under CLAUDE_CONFIG_DIR and a compaction reinjects"
-          (is (str/includes? (run-prompt-hook root "session-relocated" "hello" env)
-                             "[rule-fairy injected: base.mdc]"))
-          (is (str/blank? (run-prompt-hook root "session-relocated" "again" env))
-              "nothing new to inject while the transcript is unchanged")
-          (spit transcript "{\"type\":\"user\",\"isCompactSummary\":true}\n" :append true)
-          (is (str/includes? (run-prompt-hook root "session-relocated" "after compaction" env)
-                             "[rule-fairy injected: base.mdc]")
-              "the compaction recorded in the relocated transcript triggers reinjection"))))))
-
 (deftest state-directory-ignores-itself-test
   (with-temp-state
     (fn []
-      (rule-common/save-session-state! "session" {:sizes {}})
+      (rule-common/save-session-state! "session" {})
       (is (= "*\n" (slurp (io/file rule-common/state-dir ".gitignore")))))))
 
 (deftest mod-registration-test
@@ -668,191 +526,44 @@
         "no settings hooks remain beside it: the mod delivers every Claude Code event")
     (is (.isFile (io/file repository-directory "hooks/claude/register.ts")))))
 
-(deftest injection-batch-test
-  (with-temp-state
-    (fn []
-      (let [session-id "session"
-            event-id "event"
-            frames (mapv #(str "frame-" %) (range rule-common/hook-lane-count))
-            render-count (atom 0)
-            transcript-metrics-count (atom 0)
-            frame-request #(assoc (test-frame-request %)
-                                  :transcript-metrics-fn
-                                  (fn []
-                                    (swap! transcript-metrics-count inc)
-                                    current-metrics))]
-        (with-redefs [rule-common/injection-frames
-                      (fn [& _]
-                        (swap! render-count inc)
-                        frames)]
-          (let [deliveries (->> (range rule-common/hook-lane-count)
-                                (mapv (fn [lane-index]
-                                        (future
-                                          (rule-common/injection-frame-for-lane!
-                                           (frame-request lane-index)))))
-                                (mapv deref))]
-            (is (= 1 @render-count))
-            (is (= 1 @transcript-metrics-count))
-            (is (= (mapv (fn [lane-index]
-                           {:frame-index lane-index
-                            :frame (str "frame-" lane-index)})
-                         (range rule-common/hook-lane-count))
-                   (mapv #(select-keys % [:frame-index :frame]) deliveries)))
-            (is (= {:sizes {}}
-                   (rule-common/load-session-state session-id)))
-
-            (doseq [{:keys [frame-index]} (butlast deliveries)]
-              (rule-common/complete-injection-frame!
-               session-id event-id frame-index))
-            (is (= {:sizes {}}
-                   (rule-common/load-session-state session-id)))
-
-            (rule-common/complete-injection-frame!
-             session-id event-id (:frame-index (last deliveries)))
-            (is (= current-metrics
-                   (get-in (rule-common/load-session-state session-id)
-                           [:sizes rule-name])))
-            (is (nil? (rule-common/injection-frame-for-lane!
-                       (frame-request 0))))))))))
-
-(defn injecting-hook-record
-  "A transcript record of a prompt hook's output injecting one rule, as a
-  forked session's transcript replays it from the parent."
-  [rule-name]
-  (json/generate-string {:type "attachment"
-                         :attachment {:type "hook_success"
-                                      :hookName "UserPromptSubmit"
-                                      :content (str "[rule-fairy shard 1/1 " rule-name "]\n[rule-fairy injected: " rule-name "]\n\n# body")}}))
-
-(deftest forked-session-inherits-its-transcripts-injections-test
-  (testing "a rule the inherited context holds is marked, not delivered again"
-    (with-temp-project
-      {"-Users-example-Workspace-project/session.jsonl"
-       (str "{\"type\":\"user\",\"isCompactSummary\":true}\n"
-            (injecting-hook-record rule-name) "\n")}
-      (fn [root]
-        (with-temp-state
-          (fn []
-            (with-redefs [rule-common/claude-projects-dir (.getAbsolutePath root)
-                          rule-common/injection-frames (constantly ["frame"])]
-              (is (nil? (rule-common/injection-frame-for-lane! (test-frame-request 0))))
-              (is (= {rule-name current-metrics}
-                     (:sizes (rule-common/load-session-state "session"))))))))))
-  (testing "a rule injected before the last compaction is no longer in context and is delivered"
-    (with-temp-project
-      {"-Users-example-Workspace-project/session.jsonl"
-       (str (injecting-hook-record rule-name) "\n"
-            "{\"type\":\"user\",\"isCompactSummary\":true}\n"
-            (injecting-hook-record "other.mdc") "\n")}
-      (fn [root]
-        (with-temp-state
-          (fn []
-            (with-redefs [rule-common/claude-projects-dir (.getAbsolutePath root)
-                          rule-common/injection-frames (constantly ["frame"])]
-              (let [{:keys [frame-index] :as delivery} (rule-common/injection-frame-for-lane! (test-frame-request 0))]
-                (is (some? delivery))
-                (is (= {"other.mdc" current-metrics}
-                       (:sizes (rule-common/load-session-state "session")))
-                    "the inherited rule is marked at once, the delivered one only when its lanes complete")
-                (rule-common/complete-injection-frame! "session" "event" frame-index)
-                (is (= {"other.mdc" current-metrics rule-name current-metrics}
-                       (:sizes (rule-common/load-session-state "session"))))))))))))
-
-(deftest deduplicated-event-scans-transcript-once-test
-  (with-temp-state
-    (fn []
-      (rule-common/mark-injected! "session" {:sizes {}} [rule-name] current-metrics)
-      (let [transcript-metrics-count (atom 0)
-            frame-request #(assoc (test-frame-request %)
-                                  :transcript-metrics-fn
-                                  (fn []
-                                    (swap! transcript-metrics-count inc)
-                                    current-metrics))]
-        (doseq [lane-index (range rule-common/hook-lane-count)]
-          (is (nil? (rule-common/injection-frame-for-lane!
-                     (frame-request lane-index)))))
-        (is (= 1 @transcript-metrics-count))
-        (is (= current-metrics
-               (get-in (rule-common/load-session-state "session")
-                       [:sizes rule-name])))))))
-
-(deftest incomplete-batch-keeps-unacknowledged-lane-available-test
-  (with-temp-state
-    (fn []
-      (with-redefs [rule-common/injection-frames (constantly ["one" "two"])]
-        (let [delivery (rule-common/injection-frame-for-lane!
-                        (test-frame-request 0))]
-          (rule-common/complete-injection-frame!
-           "session" "event" (:frame-index delivery))
-          (is (= {:sizes {}}
-                 (rule-common/load-session-state "session")))
-          (is (= {:frame-index 1 :frame "two"}
-                 (select-keys
-                  (rule-common/injection-frame-for-lane!
-                   (test-frame-request 1))
-                  [:frame-index :frame])))
-          (is (some? (rule-common/injection-frame-for-lane!
-                      (test-frame-request 1))))
-          (is (nil? (rule-common/injection-frame-for-lane!
-                     (test-frame-request 2)))))))))
-
 (defn one-frame-per-rule
   "An injection-frames stand-in needing one frame per rule, the first frame
   carrying the prefix and the delivered rule names."
-  [rule-names prefix _delivery-id & _limits]
+  [rule-names prefix _delivery-id]
   (into [(str prefix "|" (str/join "," rule-names))]
         (repeat (dec (count rule-names)) "more")))
 
 (deftest partial-delivery-marks-only-the-rules-that-fit-test
   (with-temp-state
     (fn []
-      (with-redefs [rule-common/hook-lane-count 1
+      (with-redefs [rule-common/max-frames-per-delivery 1
                     rule-common/injection-frames one-frame-per-rule]
-        (let [request #(assoc (test-frame-request 0)
-                              :event-id %
-                              :selection-fn (constantly {:matching-rules ["a.mdc" "b.mdc"]
-                                                         :prefix-fn (fn [names] (str "injected " (str/join "," names)))}))
-              {:keys [frame frame-index]} (rule-common/injection-frame-for-lane! (request "first"))]
+        (let [selection (constantly {:matching-rules ["a.mdc" "b.mdc"]
+                                     :prefix-fn (fn [names] (str "injected " (str/join "," names)))})
+              {[frame] :context} (delivery "first" selection)]
           (is (= (str "[rule-fairy deferred: b.mdc (past what one delivery can carry; delivered with the next matching event)]\n"
                       "injected a.mdc"
                       "|a.mdc")
                  frame)
-              "the shard carries the rules that fit and opens by naming the deferred one")
-          (rule-common/complete-injection-frame! "session" "first" frame-index)
-          (is (= {"a.mdc" current-metrics} (:sizes (rule-common/load-session-state "session")))
-              "only the delivered rule is marked")
-          (let [{:keys [frame frame-index]} (rule-common/injection-frame-for-lane! (request "second"))]
-            (is (= "injected b.mdc|b.mdc" frame)
-                "the next matching event delivers the rest, with nothing left to defer")
-            (rule-common/complete-injection-frame! "session" "second" frame-index))
-          (is (= {"a.mdc" current-metrics "b.mdc" current-metrics}
-                 (:sizes (rule-common/load-session-state "session")))))))))
+              "the entry carries the rules that fit and opens by naming the deferred one")
+          (is (= #{"a.mdc"} (delivered-rules))
+              "only the delivered rule is recorded")
+          (is (= {:context ["injected b.mdc|b.mdc"]} (delivery "second" selection))
+              "the next matching event delivers the rest, with nothing left to defer")
+          (is (= #{"a.mdc" "b.mdc"} (delivered-rules))))))))
 
 (deftest oversized-rule-is-reported-and-not-marked-test
   (with-temp-state
     (fn []
-      (with-redefs [rule-common/hook-lane-count 1
+      (with-redefs [rule-common/max-frames-per-delivery 1
                     rule-common/injection-frames (constantly ["one" "two"])]
-        (let [{:keys [event-id frame-index frame] :as delivery}
-              (rule-common/injection-frame-for-lane!
-               (test-frame-request 0))]
-          (is (some? delivery))
-          (is (str/includes? frame (str "[rule-fairy error: " rule-name " alone needs 2 output frames")))
+        (let [{[frame :as context] :context} (delivery "event" test-selection)]
+          (is (= 1 (count context)))
+          (is (str/includes? frame (str "[rule-fairy error: " rule-name " alone needs 2 context entries, but one delivery carries 1]")))
           (is (str/includes? frame "No matched rules were injected"))
-          (rule-common/complete-injection-frame! "session" event-id frame-index)
-          (is (= {:sizes {}}
-                 (rule-common/load-session-state "session")))
-          (is (nil? (rule-common/injection-frame-for-lane!
-                     (test-frame-request 0)))))))))
-
-(defn shell-frame-request
-  "A frame request whose selection delivers pending shell paths."
-  [lane-index paths matching-rules]
-  (assoc (test-frame-request lane-index)
-         :selection-fn (fn []
-                         {:matching-rules matching-rules
-                          :prefix-fn (constantly "prefix")
-                          :paths paths})))
+          (is (= #{} (delivered-rules)))
+          (is (= [frame] (:context (delivery "next" test-selection)))
+              "reported again on the next event, until the rule is fixed"))))))
 
 (defn shell-pending-state []
   (:shell-pending (rule-common/load-session-state "session")))
@@ -870,107 +581,85 @@
       (is (every? #(= 60 (count %)) paths))
       (is (str/includes? prefix "/f15.clj and 14 more, changed by a shell command]"))
       (is (not (str/includes? prefix "/f16.clj")))))
-  (testing "twenty 512-character paths: one named, the rest counted, prefix inside the frame"
+  (testing "twenty 512-character paths: one named, the rest counted, prefix near its budget"
     (let [segment (apply str (repeat 70 "a"))
           paths (mapv #(str "src/" (str/join "/" (repeat 7 segment)) "/file-" % ".clj") (range 20))
           prefix (rule-common/shell-prefix ["a.mdc"] paths)]
       (is (= 512 (apply max (map count paths))))
       (is (str/includes? prefix "/file-0.clj and 19 more, changed by a shell command]"))
-      (is (< (count prefix) (quot rule-common/max-hook-context-chars 2)))))
+      (is (< (count prefix) 2000))))
   (testing "a single path longer than the budget is counted, not named"
     (let [prefix (rule-common/shell-prefix ["a.mdc"] [(apply str (repeat 1200 "p"))])]
       (is (str/includes? prefix "[rule-fairy matched: glob on 1 paths, changed by a shell command]"))))
-  (testing "hundreds of paths, as after a rebase, leave the prefix far inside the frame"
+  (testing "hundreds of paths, as after a rebase, keep the prefix near its budget"
     (let [many (mapv #(str "apps/home/src/scarlet/home/ui/some/deeply/nested/namespace/file_" % "_controller.clj")
                      (range 300))
           prefix (rule-common/shell-prefix (mapv #(str "rule-" % ".mdc") (range 14)) many)]
       (is (re-find #" and 2\d\d more, changed by a shell command\]" prefix))
-      (is (< (count prefix) (quot rule-common/max-hook-context-chars 2))))))
+      (is (< (count prefix) 2000)))))
 
-(deftest shell-paths-stay-pending-until-every-lane-delivered-test
+(deftest shell-paths-clear-with-their-delivery-test
   (with-temp-state
     (fn []
-      (rule-common/save-session-state! "session" {:sizes {} :shell-pending ["src/x.clj" "src/y.clj"]})
+      (rule-common/save-session-state! "session" {:shell-pending ["src/x.clj" "src/y.clj"]})
       (with-redefs [rule-common/injection-frames (constantly ["one" "two"])]
-        (let [request #(shell-frame-request % ["src/x.clj"] [rule-name])
-              first-delivery (rule-common/injection-frame-for-lane! (request 0))]
-          (is (= ["src/x.clj" "src/y.clj"] (shell-pending-state))
-              "building the batch delivers nothing yet")
-          (rule-common/complete-injection-frame! "session" "event" (:frame-index first-delivery))
-          (is (= ["src/x.clj" "src/y.clj"] (shell-pending-state))
-              "one lane of two is not delivery")
-          (rule-common/complete-injection-frame!
-           "session" "event" (:frame-index (rule-common/injection-frame-for-lane! (request 1))))
-          (is (= ["src/y.clj"] (shell-pending-state))
-              "the last lane's acknowledgement clears the batch's paths")
-          (is (= current-metrics
-                 (get-in (rule-common/load-session-state "session") [:sizes rule-name]))))))))
+        (is (= {:context ["one" "two"]} (delivery "event" (shell-selection ["src/x.clj"] [rule-name]))))
+        (is (= ["src/y.clj"] (shell-pending-state))
+            "the delivery clears the paths it delivered for, and no others")
+        (is (= #{rule-name} (delivered-rules)))))))
 
 (deftest shell-paths-with-nothing-to-deliver-clear-at-once-test
   (with-temp-state
     (fn []
       (testing "no rule matches the paths"
-        (rule-common/save-session-state! "session" {:sizes {} :shell-pending ["src/x.clj"]})
-        (is (nil? (rule-common/injection-frame-for-lane! (shell-frame-request 0 ["src/x.clj"] []))))
+        (rule-common/save-session-state! "session" {:shell-pending ["src/x.clj"]})
+        (is (= {:context []} (delivery "event" (shell-selection ["src/x.clj"] []))))
         (is (= [] (shell-pending-state))))
-      (testing "every matching rule is already injected"
-        (rule-common/save-session-state! "session" {:sizes {rule-name current-metrics}
-                                                    :shell-pending ["src/x.clj"]})
-        (is (nil? (rule-common/injection-frame-for-lane!
-                   (assoc (shell-frame-request 0 ["src/x.clj"] [rule-name]) :event-id "later"))))
+      (testing "every matching rule is in the conversation already"
+        (rule-common/save-session-state! "session" {:shell-pending ["src/x.clj"]})
+        (is (= {:context []}
+               (delivery "later" (shell-selection ["src/x.clj"] [rule-name]) (in-context rule-name))))
         (is (= [] (shell-pending-state)))))))
 
 (deftest shell-paths-stay-pending-across-a-partial-delivery-test
   (with-temp-state
     (fn []
-      (rule-common/save-session-state! "session" {:sizes {} :shell-pending ["src/x.clj"]})
-      (with-redefs [rule-common/hook-lane-count 1
+      (rule-common/save-session-state! "session" {:shell-pending ["src/x.clj"]})
+      (with-redefs [rule-common/max-frames-per-delivery 1
                     rule-common/injection-frames one-frame-per-rule]
-        (let [request #(assoc (shell-frame-request 0 ["src/x.clj"] ["a.mdc" "b.mdc"]) :event-id %)
-              first-delivery (rule-common/injection-frame-for-lane! (request "first"))]
-          (rule-common/complete-injection-frame! "session" "first" (:frame-index first-delivery))
+        (let [selection (shell-selection ["src/x.clj"] ["a.mdc" "b.mdc"])]
+          (delivery "first" selection)
           (is (= ["src/x.clj"] (shell-pending-state))
               "a delivery that defers a rule keeps the path for the next shell command")
-          (is (= {"a.mdc" current-metrics} (:sizes (rule-common/load-session-state "session"))))
-          (let [second-delivery (rule-common/injection-frame-for-lane! (request "second"))]
-            (rule-common/complete-injection-frame! "session" "second" (:frame-index second-delivery)))
+          (is (= #{"a.mdc"} (delivered-rules)))
+          (delivery "second" selection)
           (is (= [] (shell-pending-state))
               "the path clears once the last deferred rule has been delivered")
-          (is (= {"a.mdc" current-metrics "b.mdc" current-metrics}
-                 (:sizes (rule-common/load-session-state "session")))))))))
+          (is (= #{"a.mdc" "b.mdc"} (delivered-rules))))))))
 
 (deftest shell-paths-stay-pending-for-an-oversized-rule-test
   (with-temp-state
     (fn []
-      (rule-common/save-session-state! "session" {:sizes {} :shell-pending ["src/x.clj"]})
-      (with-redefs [rule-common/hook-lane-count 1
+      (rule-common/save-session-state! "session" {:shell-pending ["src/x.clj"]})
+      (with-redefs [rule-common/max-frames-per-delivery 1
                     rule-common/injection-frames (constantly ["one" "two"])]
-        (let [{:keys [event-id frame-index frame]}
-              (rule-common/injection-frame-for-lane! (shell-frame-request 0 ["src/x.clj"] [rule-name]))]
+        (let [{[frame] :context} (delivery "event" (shell-selection ["src/x.clj"] [rule-name]))]
           (is (str/includes? frame "No matched rules were injected"))
-          (rule-common/complete-injection-frame! "session" event-id frame-index)
           (is (= ["src/x.clj"] (shell-pending-state))
-              "a rule that cannot fit the lanes delivers nothing, so the path waits and the next command fails loudly again")
-          (is (= {} (:sizes (rule-common/load-session-state "session")))))))))
+              "a rule that cannot fit one delivery delivers nothing, so the path waits and the next command reports it again")
+          (is (= #{} (delivered-rules))))))))
 
-(deftest failed-batch-render-is-not-persisted-test
+(deftest failed-render-marks-nothing-test
   (with-temp-state
     (fn []
-      (let [render-count (atom 0)]
-        (with-redefs [rule-common/injection-frames
-                      (fn [& _]
-                        (swap! render-count inc)
-                        (throw (ex-info "render failed" {})))]
-          (is (thrown-with-msg?
-               clojure.lang.ExceptionInfo
-               #"render failed"
-               (rule-common/injection-frame-for-lane!
-                (test-frame-request 0))))
-          (is (= {:sizes {}}
-                 (rule-common/load-session-state "session")))
-          (is (nil? (rule-common/injection-frame-for-lane!
-                     (test-frame-request 1))))
-          (is (= 1 @render-count)))))))
+      (rule-common/save-session-state! "session" {:shell-pending ["src/x.clj"]})
+      (with-redefs [rule-common/injection-frames (fn [& _] (throw (ex-info "render failed" {})))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"render failed"
+                              (delivery "event" (shell-selection ["src/x.clj"] [rule-name]))))
+        (is (= #{} (delivered-rules))
+            "nothing is recorded")
+        (is (= ["src/x.clj"] (shell-pending-state))
+            "the path stays pending for the next command")))))
 
 (deftest shared-renderer-test
   (with-temp-rules
@@ -990,48 +679,47 @@
         (is (str/includes? rendered "Name each testing block by its phase."))
         (is (not (str/includes? rendered "not imported")))))))
 
-(defn mod-delivery
-  "One mod delivery of the named rules for the session, with the frames its
-  conversation already holds."
-  [event-id rule-names in-context-frames]
-  (rule-common/deliver!
-   {:session-id "session"
-    :event-id event-id
-    :transcript-metrics-fn (constantly current-metrics)
-    :selection-fn (fn []
-                    {:matching-rules rule-names
-                     :prefix-fn (fn [names]
-                                  (str/join "\n" (map #(str "[rule-fairy injected: " % "]") names)))})
-    :in-context-frames in-context-frames}))
-
-(deftest mod-delivery-test
+(deftest delivery-reads-the-conversation-test
   (with-temp-rules
-    (merge (large-rule-files ["x" "y" "z"] 40)
-           {".cursor/rules/a.mdc" "---\nglobs: src/**\nalwaysApply: false\n---\n# A rule\n"
-            ".cursor/rules/b.mdc" "---\nglobs: src/**\nalwaysApply: false\n---\n# B rule\n"})
+    {".cursor/rules/a.mdc" "---\nglobs: src/**\nalwaysApply: false\n---\n# A rule\n"
+     ".cursor/rules/b.mdc" "---\nglobs: src/**\nalwaysApply: false\n---\n# B rule\n"}
     (fn [_]
       (with-temp-state
         (fn []
-          (testing "a session whose context already holds a rule's delivery, as after a fork, delivers only the rest"
-            (let [{:keys [context]} (mod-delivery "first" ["a.mdc" "b.mdc"]
-                                                  ["[rule-fairy shard 1/1 d1]\n[rule-fairy injected: a.mdc]"])]
-              (is (= 1 (count context)))
-              (is (str/includes? (first context) "[rule-fairy injected: b.mdc]"))
-              (is (str/includes? (first context) "# B rule"))
-              (is (not (str/includes? (first context) "# A rule")))
-              (is (= {"a.mdc" current-metrics "b.mdc" current-metrics}
-                     (:sizes (rule-common/load-session-state "session"))))))
-          (testing "the next event with the same rules delivers nothing"
-            (is (= {:context []} (mod-delivery "second" ["a.mdc" "b.mdc"] []))))))
+          (let [selection (naming-selection ["a.mdc" "b.mdc"])
+                injected-lines (fn [{:keys [context]}]
+                                 (filter #(str/starts-with? % "[rule-fairy injected: ")
+                                         (mapcat str/split-lines context)))
+                t0 1000000]
+            (testing "a rule whose whole delivery the conversation holds, as after a fork, is not delivered; one it lacks is"
+              (let [{[entry] :context :as delivered} (delivery "first" selection (in-context "a.mdc") t0)]
+                (is (= ["[rule-fairy injected: b.mdc]"] (injected-lines delivered)))
+                (is (str/includes? entry "# B rule"))
+                (is (not (str/includes? entry "# A rule")))
+                (is (= {"b.mdc" t0} (:delivered (rule-common/load-session-state "session"))))))
+            (testing "within the window a delivered rule is not delivered again, even while the conversation does not show it yet"
+              (is (= {:context []} (delivery "second" selection (in-context "a.mdc") (+ t0 59000)))))
+            (testing "past the window, with the conversation emptied as after a compaction, both are delivered again"
+              (is (= ["[rule-fairy injected: a.mdc]" "[rule-fairy injected: b.mdc]"]
+                     (injected-lines (delivery "third" selection [] (+ t0 61000)))))
+              (is (= {"a.mdc" (+ t0 61000) "b.mdc" (+ t0 61000)}
+                     (:delivered (rule-common/load-session-state "session")))))))))))
+
+(deftest large-rules-arrive-as-one-entry-test
+  (with-temp-rules
+    (large-rule-files ["x" "y" "z"] 40)
+    (fn [_]
       (with-temp-state
         (fn []
-          (testing "rules the lanes would split across frames arrive as one entry"
-            (let [{:keys [context]} (mod-delivery "large" ["x.mdc" "y.mdc" "z.mdc"] [])]
+          (testing "three 12 KB rules arrive whole as one entry, headed and named, and are recorded"
+            (let [{:keys [context]} (delivery "large" (naming-selection ["x.mdc" "y.mdc" "z.mdc"]))
+                  entry (first context)]
               (is (= 1 (count context)))
-              (is (> (count (first context)) (* 3 rule-common/max-hook-context-chars)))
-              (is (str/starts-with? (first context) "[rule-fairy shard 1/1 "))
-              (is (= #{"x.mdc" "y.mdc" "z.mdc"}
-                     (set (keys (:sizes (rule-common/load-session-state "session")))))))))))))
+              (is (> (count entry) 30000))
+              (is (str/starts-with? entry "[rule-fairy shard 1/1 large]\n[rule-fairy injected: x.mdc]\n[rule-fairy injected: y.mdc]\n[rule-fairy injected: z.mdc]\n\n"))
+              (doseq [rule-stem ["x" "y" "z"]]
+                (is (str/includes? entry (rule-paragraph rule-stem 39))))
+              (is (= #{"x.mdc" "y.mdc" "z.mdc"} (delivered-rules))))))))))
 
 (deftest plugin-root-recorded-test
   (with-temp-project

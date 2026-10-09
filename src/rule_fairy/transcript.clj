@@ -9,11 +9,10 @@
   a partial trailing line waits for the next scan, so a record is never split
   across two scans and miscounted.
 
-  A transcript can also start with history: a forked session's transcript
-  replays the parent's records, hook outputs included, under the new session
-  id. `inherited-injections` reads the rules those records already injected."
-  (:require [cheshire.core :as json]
-            [clojure.string :as str])
+  The hook outputs a conversation holds can also be read back:
+  `frames-injections` names the rules the whole Rule Fairy deliveries among
+  them injected."
+  (:require [clojure.string :as str])
   (:import [java.nio ByteBuffer]
            [java.nio.channels FileChannel]
            [java.nio.charset StandardCharsets]
@@ -61,41 +60,6 @@
 (def ^:private shard-header-pattern #"\[rule-fairy shard (\d+)/(\d+) ([^\s\]]+)\]")
 (def ^:private marker-pattern #"\[rule-fairy ([a-z]+): (.*)\]")
 
-(defn- hook-outputs
-  "The context texts a record delivered, when it is a hook attachment. A
-  hook_success attachment, a settings hook's record, delivers its content,
-  where a prompt hook's output lands, and the additionalContext inside its
-  stdout JSON, where a tool hook's lands. A hook_additional_context
-  attachment, a mod's record, delivers each entry of its content list.
-  Empty for every other record. The substring test keeps JSON parsing to
-  the candidate lines, and another hook's stdout that is not JSON is
-  skipped."
-  [line]
-  (if-not (or (str/includes? line "hook_success")
-              (str/includes? line "hook_additional_context"))
-    []
-    (let [{:keys [type attachment]} (json/parse-string line true)
-          {:keys [content stdout]} attachment]
-      (cond
-        (not= "attachment" type)
-        []
-
-        (= "hook_additional_context" (:type attachment))
-        (filter string? (when (sequential? content) content))
-
-        (= "hook_success" (:type attachment))
-        (let [additional-context (when (and (string? stdout)
-                                            (str/starts-with? (str/triml stdout) "{"))
-                                   (try
-                                     (-> (json/parse-string stdout true)
-                                         :hookSpecificOutput
-                                         :additionalContext)
-                                     (catch Exception _ nil)))]
-          (filter string? [content additional-context]))
-
-        :else
-        []))))
-
 (defn- shard-record
   "The frame a hook output is, as {:delivery id :shard i :shards n :injected
   [name ...]}, when its first line is a Rule Fairy shard header carrying a
@@ -119,7 +83,7 @@
 (defn- whole-deliveries
   "The rule names of every delivery whose shards are all present, in order
   of each delivery's first record. Records are grouped by the id their
-  headers carry, so the order the lanes finished in and other deliveries'
+  headers carry, so the order the frames arrived in and other deliveries'
   records between them do not matter."
   [records]
   (let [by-delivery (group-by :delivery records)]
@@ -144,25 +108,3 @@
        whole-deliveries
        distinct
        vec))
-
-(defn inherited-injections
-  "Rule names the complete records after the transcript's last compaction
-  summary show as injected by Rule Fairy, in first-appearance order. A
-  forked session's transcript replays the parent's hook outputs under the
-  new session id and names the parent nowhere, so these records are the only
-  trace of what the inherited context already holds. A frame counts only as
-  a hook attachment, a settings hook's hook_success or a mod's
-  hook_additional_context, whose output passes frames-injections. Reads the
-  whole file once, which the caller does once per session."
-  [^Path path compaction-pattern]
-  (let [content (slurp (.toFile path))
-        complete (if-let [last-newline (str/last-index-of content "\n")]
-                   (subs content 0 last-newline)
-                   "")]
-    (->> (str/split-lines complete)
-         (reduce (fn [outputs line]
-                   (if (re-find compaction-pattern line)
-                     []
-                     (into outputs (hook-outputs line))))
-                 [])
-         frames-injections)))

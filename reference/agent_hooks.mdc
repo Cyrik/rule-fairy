@@ -1,6 +1,6 @@
 ---
 description: Agent hooks: Codex and Claude hook setup for rule injection, document expansion, dedup state, and hook pitfalls
-promptAnyOf: hooks/run, hooks.json, codex-hooks.json, plugin.json, rule fairy hooks, hook injection, reinjection, codex hooks, agent hooks, UserPromptSubmit, PreToolUse, PostToolUse, additionalContext, glob cache, transcript_path, context compaction, document expansion, rule-fairy.edn
+promptAnyOf: hooks/run, hooks.json, codex-hooks.json, plugin.json, rule fairy hooks, hook injection, reinjection, codex hooks, agent hooks, mod, mods, register.ts, mod.bb, prompt.submit, tool.call, UserPromptSubmit, PreToolUse, PostToolUse, additionalContext, glob cache, transcript_path, context compaction, document expansion, rule-fairy.edn, claude plugin test
 globs: hooks/**, src/rule_fairy/*.clj, .claude-plugin/*.json, .codex-plugin/*.json
 alwaysApply: false
 ---
@@ -9,21 +9,22 @@ alwaysApply: false
 
 ## Architecture
 
-Rule Fairy is one plugin for both harnesses. Claude Code reads `.claude-plugin/plugin.json` and `hooks/hooks.json`;
-Codex reads the portable root `plugin.json` (Agent Plugins schema, which makes it discover `skills/` itself) with
-`.codex-plugin/plugin.json` as its overlay pointing at `hooks/codex-hooks.json`. Every registered command runs
-`hooks/run <harness>/<script>.bb`, a POSIX shell wrapper that resolves the plugin root (`CLAUDE_PLUGIN_ROOT`,
-`PLUGIN_ROOT`, or its own location), adds the usual `bb` install locations to a minimal PATH, and starts Babashka
-with `--config <plugin>/bb.edn` so a consuming repository's `bb.edn` never reaches the classpath.
+Rule Fairy is one plugin for both harnesses. Claude Code reads `.claude-plugin/plugin.json` and `hooks/hooks.json`,
+whose `modules` entry names the mod, `hooks/claude/register.ts`: a hooks module Claude Code loads in its own process
+and calls on its events. Codex reads `.codex-plugin/plugin.json`, which points at `hooks/codex-hooks.json`, settings-style
+command hooks, and lists the interface; `skills/` is discovered by convention. Every Babashka process either side starts
+runs `hooks/run <harness>/<script>.bb`, a POSIX shell wrapper that resolves the plugin root (`CLAUDE_PLUGIN_ROOT`,
+`PLUGIN_ROOT`, or its own location), adds the usual `bb` install locations to a minimal PATH, and starts Babashka with
+`--config <plugin>/bb.edn` so a consuming repository's `bb.edn` never reaches the classpath.
 
 Rule discovery, frontmatter parsing, glob and prompt matching, import expansion and rendering live in `rule-fairy.rules`,
 on top of the line-level Markdown model in `rule-fairy.markdown`; `rule-fairy.config` reads `rule-fairy.edn`;
-incremental transcript scanning is `rule-fairy.transcript`. The rules source is `rules/project-rules-source`: Cursor's
-`.cursor/rules/**/*.mdc` unless `rule-fairy.edn` at the project root sets `{:rules {:dirs [...] :extensions [...]}}`. Rule
-names stay relative to their own directory; a name present in two directories fails the index.
-Session dedup state is `rule-fairy.session-state`, shared by both adapters. The adapters own everything harness-specific:
-hook input, project-root discovery, transcript location and marker pattern, glob caches, path relativisation, and output
-encoding.
+`rule-fairy.transcript` holds Codex's incremental transcript scanning and the frame reader Claude Code's dedup uses. The
+rules source is `rules/project-rules-source`: Cursor's `.cursor/rules/**/*.mdc` unless `rule-fairy.edn` at the project
+root sets `{:rules {:dirs [...] :extensions [...]}}`. Rule names stay relative to their own directory; a name present in
+two directories fails the index. Session state is `rule-fairy.session-state`, shared by both adapters. The adapters own
+everything harness-specific: hook input, project-root discovery, the dedup source (the conversation on Claude Code, the
+transcript on Codex), glob caches, path relativisation, and output encoding.
 
 The review side is separate from the hooks. `rule-fairy.bundle` builds a review bundle for a path list from
 `rule-fairy.instructions` (harness instruction files, imports, one copy per real file), the rules and their documentation,
@@ -51,17 +52,31 @@ review.
 
 ### Claude Code
 
-| Hook | Event | Script | Purpose |
-|------|-------|--------|---------|
-| `hooks/claude/prompt.bb` | `UserPromptSubmit` | Always-on rules plus keyword match on prompt text | Inject rules when the user mentions relevant topics |
-| `hooks/claude/edit.bb` | `PreToolUse` (Edit, Write, MultiEdit, NotebookEdit, MCP edit tools) | Glob match on target file path | Inject rules before a matching file is edited |
+| Hook in `register.ts` | Fires when | Purpose |
+|------|-------|---------|
+| `prompt.submit` | a prompt is submitted | Always-on rules plus keyword match on the prompt text, attached after the prompt. A prompt another agent or process composed (`e.origin.kind` is task-notification, peer, peer-send-message, projects-relay, coordinator, observer, observer-activity or plugin) selects nothing: keyword rules match what the person asked |
+| `tool.call` on Edit, Write, MultiEdit, NotebookEdit and MCP tools named `edit`, `write` or `patch` | a tool call ran | Glob match on the edited path, attached with the tool's result; nothing in a subagent (`e.agentId`) or on a denied call |
+| `tool.call` on Bash | a shell command ran | The shell check (see Edits made through the shell), attached with the command's result |
 
-Claude Code runs hook commands in the session `cwd`, which follows the agent's shell, and exports
-`CLAUDE_PROJECT_DIR`, `CLAUDE_PLUGIN_ROOT`, and `CLAUDE_PLUGIN_DATA`. `hooks/claude/common.bb` takes the project root from
-`CLAUDE_PROJECT_DIR`; nothing depends on the cwd.
+Each hook runs `hooks/claude/mod.bb` once through `hooks/run`, with `{"kind": "prompt" | "edit" | "shell", "input":
+{...}}` on stdin: the session id, the cwd, the prompt or tool fields, and `in_context_frames`, the heads of the Rule
+Fairy frames the hook found in the conversation (`$.session.messages({ as: 'api' })`, the Messages API form, where a
+mod's context renders as `<system-reminder>\n<event> hook additional context: ...`). `mod.bb` prints `{"context":
+[...]}` and the hook attaches the entries. `CLAUDE_PROJECT_DIR` is `$.session.root()`, the process runs in
+`$.session.cwd()`, and nothing depends on the cwd. Claude Code 2.1.287 or later loads mods. On an older version the
+module does not load and nothing is injected, while settings hooks and the skills work. `disableAllHooks` stops the
+module and every settings hook and leaves the skills. `--safe-mode` disables installed plugins altogether. An
+organisation's `allowManagedModsOnly` policy stops the module alone: settings hooks keep running and the skills load.
+`claude plugin test` from a directory without a mod says whether mods can load at all but does not report that policy,
+whose refusal shows in the debug log.
 
-Each Rule Fairy event has 12 commands for the same script. `RULE_FAIRY_LANE` gives every command a distinct identity because Claude deduplicates
-identical command hooks. Lane `n` owns frame `n` in the shared event batch.
+A hook that fails is skipped by Claude Code and the event goes on. Each of the three carries a `.catch` handler. A
+process exiting non-zero yields one context entry, `[rule-fairy error: <kind> delivery failed (exit N)]`, the head of
+its stderr and `No matched rules were injected or marked as injected.`; a hook that throws or times out gets the same
+kind of entry from its handler, appended to the replayed tool result, or attached on the way down for a prompt that
+had not entered yet and only logged once it has. Both log `rule-fairy: <kind> delivery ...` to the transcript, the
+line the person sees. The hook budget is ten seconds of the hook's own time and stops while the process runs;
+`$.process.run` is given 60 seconds.
 
 ## Injection Flow
 
@@ -73,9 +88,9 @@ identical command hooks. Lane `n` owns frame `n` in the shared event batch.
    `promptAnyOf` term match the prompt
 4. Injects the selected contents, labelled `[rule-fairy matched: alwaysApply ...]` and `[rule-fairy matched: keyword ...]`
 
-Always-on rules are injected with the first prompt of a session, not at session start, and again after compaction or
-transcript growth like any other rule. Because they match every prompt, the session state is consulted on every prompt;
-the hooks then read transcript metrics once per prompt event to decide on reinjection. Do not duplicate always-on rule
+Always-on rules are injected with the first prompt of a session, not at session start, and again after compaction like
+any other rule. Because they match every prompt, dedup is consulted on every prompt: on Claude Code the conversation and
+the recent-delivery record, on Codex the session state and the transcript metrics. Do not duplicate always-on rule
 content in `CLAUDE.md` or `AGENTS.md`.
 
 ### Glob-based
@@ -83,37 +98,35 @@ content in `CLAUDE.md` or `AGENTS.md`.
 2. Parses `globs:` from the rules source's frontmatter, through a per-harness glob cache that is invalidated by rule-tree mtime
    and by a changed rules source
 3. Matches file path against parsed globs
-4. Injects matched MDC contents via JSON `hookSpecificOutput.additionalContext`
+4. Injects the matched rule contents: on Claude Code as context entries with the tool's result, on Codex via JSON
+   `hookSpecificOutput.additionalContext`
 
 ### Claude bounded delivery
-Claude Code saves a hook output larger than 10,000 characters to a temporary file and gives the model only a preview and the file path. Agents do not reliably read that file.
+Claude Code reads a mod's context entry whole up to 100,000 characters and one event's entries together up to 200,000,
+handing the model a head and a file path past either. A settings hook's output is cut at 10,000 characters
+(anthropics/claude-code#94358), which is why the Claude Code side is a mod. One delivery is therefore at most two frames
+(`max-frame-chars` and `max-frames-per-delivery` in `hooks/claude/common.bb`):
 
-The Claude hooks therefore deliver one logical injection through 12 fixed output lanes:
-
-1. The first lane to acquire the per-session file lock selects the rules, reads transcript metrics once, and creates the event batch.
-2. The batch renders the matched rules once and splits semantic rule and documentation blocks at Markdown headings or paragraphs.
-3. Fenced code blocks stay intact. A fenced block that cannot fit fails instead of producing invalid Markdown.
-4. The batch packs the parts into context frames of at most 9,000 characters. Only the first frame carries the full matched-rule roster
-   and hook description; later frames use that space for rule content.
-5. Lane `n` writes and flushes frame `n` when it exists, then acknowledges delivery.
-6. The final acknowledgement marks all rules as injected and replaces the batch with a 30-second completion marker so late handlers cannot recreate the event.
-
-Frame order is not significant. Every frame has a shard marker, and every split part repeats its rule or documentation heading and includes a part number.
-
-A repeated event retries the frame for an unacknowledged lane. If one lane fails, the batch remains uncommitted so the next matching event
-re-injects the full rule set. If a batch needs more frames than configured lanes, lane `0` reports the capacity error, no rule content is
-delivered, and no rule is marked as injected. An event with no rules to inject stores the same short-lived completion marker so the remaining
-lanes do not repeat rule selection or transcript scanning.
+1. The matched rules that dedup lets through are rendered once, and semantic rule and documentation blocks split at Markdown
+   headings or paragraphs. Fenced code blocks stay intact; one that cannot fit fails instead of producing invalid Markdown.
+2. The parts pack into frames under the limit. Only the first frame carries the marker lines and the contract; later frames
+   use that space for rule content.
+3. `fitting-delivery` tries the set in match order and shortens it until the frames fit two entries and the documentation
+   fits the engine's 64 KiB budget. The first frame then opens with `[rule-fairy deferred: ...]` naming the rest, which
+   comes with the next event that matches it. A single rule that fits neither is reported as the one entry
+   (`[rule-fairy error: <rule> alone ...]`) and nothing is recorded.
+4. Every frame opens with `[rule-fairy shard i/n <delivery>]`, the delivery id being the leading twelve hex digits of the
+   event id, so a reader of the conversation can group one delivery's frames and tell neighbours apart.
 
 ### Codex bounded delivery
 Codex applies its own cap to hook `additionalContext`: 2,500 tokens by default. Larger output is saved under
 `<temp_dir>/hook_outputs/<session_id>/<uuid>.txt` and the model receives a head-and-tail preview with the path, so a rule
-bundle is silently cut in the same way Claude cuts output over 10,000 characters.
+bundle is silently cut in the same way Claude Code cuts a settings hook's output over 10,000 characters.
 
-Unlike Claude, the Codex cap is configurable per hook. Every Rule Fairy hook entry in `hooks/codex-hooks.json` sets
-`additionalContextLimit: 0`, which passes the complete `additionalContext` through. The Codex adapter therefore delivers
-one unsharded payload and relies on the engine's 64 KiB documentation budget as the only size guard. Do not remove the
-key when editing the registration; the failure is silent.
+Unlike a Claude Code settings hook, the Codex cap is configurable per hook. Every Rule Fairy hook entry in
+`hooks/codex-hooks.json` sets `additionalContextLimit: 0`, which passes the complete `additionalContext` through. The
+Codex adapter therefore delivers one unsharded payload and relies on the engine's 64 KiB documentation budget as the only
+size guard. Do not remove the key when editing the registration; the failure is silent.
 
 Codex states that the setting applies only to `additionalContext` and that tool feedback and continuation prompts keep the
 default limit. Whether the `continue: false` path used by `hooks/codex/post_edit.bb` counts as feedback is not documented.
@@ -129,61 +142,61 @@ Both paths render their payload through `rule-fairy.rules`:
 5. Remove non-nested `<!-- agent-context: omit -->` blocks
 6. Append the selected canonical documentation to the rule payload
 
-The expanded documentation has a 64 KiB safety budget per hook payload. Missing files, missing headings, invalid omission markers, and oversized payloads fail instead of silently dropping required context. On Claude Code a matched set over the budget is delivered as far as it fits and the rest deferred to the next matching event, as for a set too large for the lanes; a single rule over the budget still fails.
+The expanded documentation has a 64 KiB safety budget per hook payload. Missing files, missing headings, invalid omission
+markers, and oversized payloads fail instead of silently dropping required context. On Claude Code a matched set over the
+budget is delivered as far as it fits and the rest deferred to the next matching event, as for a set too large for two
+entries; a single rule over the budget still fails.
 
 ## Dedup / Reinjection
 
-Hooks share the same dedup mechanism to avoid flooding the context:
+Both adapters keep one state file per session, `.rule-fairy/<harness>/<session-id>.edn`, written under a per-session
+file lock; both state directories write a `.gitignore` containing `*` on first use, so they never show up as untracked.
+Every hook of a harness shares its session's state, so a rule delivered by the prompt hook is not delivered again by the
+edit hook, and the other way round. Old state files are cleaned up after 4 hours.
 
-- **Codex state files** in `.rule-fairy/codex/<session-id>.edn`
-- Both state directories write a `.gitignore` containing `*` on first use, so they never show up as untracked
-- **Claude state files** in `.rule-fairy/claude/<session-id>.edn`
-- **Claude in-flight batches** in `.rule-fairy/claude/batches/<session-id>/`
-- Tracks `{rule-name → {:size transcript-size-at-injection :compaction-count n}}` in one `:sizes` map per session. Every
-  hook of a harness shares it, so a rule delivered by the prompt hook is not delivered again by the edit hook, and the
-  other way round.
-- `:transcript-scan {:scanned-bytes n :compaction-count c}` remembers how far the transcript has been counted. Each event
-  reads only the bytes appended since, and only complete lines, so a record is never split across two scans. A transcript
-  shorter than the cursor is rescanned from the start. Shared implementation: `rule-fairy.transcript`.
-- First injection: always inject, except that a session whose transcript already holds Rule Fairy injections it has no
-  record of (a forked Claude Code session replays its parent's hook records under its own session id) starts with those
-  rules marked as injected, read once from the hook_success attachments after the last compaction summary; a frame
-  counts only when its output opens with the shard header, and a delivery only when all its shards, grouped by the
-  id in the header, are present
-  (`rule-fairy.transcript/inherited-injections`)
-- Subsequent: re-inject after context compaction or **2MB of transcript growth** since last injection. Transcript growth is a deliberately
-  coarse fallback for silent context cleanup that can discard earlier hook injections without a normal compaction record.
-- Existing numeric state entries are treated as pre-compaction metrics and migrate on their next injection
-- Old state files cleaned up after 4 hours
+- **Claude Code** reads the conversation. A rule is delivered when no whole delivery of it is among the frames the hook
+  found (`rule-fairy.transcript/frames-injections`: a frame counts only when it opens with the shard header, a delivery
+  only when all its shards, grouped by the id in the header, are present) and none was recorded within the last minute
+  (`:delivered {rule-name epoch-ms}`, `recent-delivery-ms`). The minute closes the race of tool calls that run side by
+  side, whose hooks read the conversation before either result is recorded. A compaction empties the conversation of
+  past deliveries, so the next matching event delivers again; a forked session starts with what it inherited; no
+  transcript file is read. `$.session.messages` returns the newest 4,096 entries, so a rule delivered further back than
+  that is delivered again.
+- **Codex** tracks `{rule-name → {:size transcript-size-at-injection :compaction-count n}}` in one `:sizes` map and
+  `:transcript-scan {:scanned-bytes n :compaction-count c}`, how far the transcript has been counted. Each event reads
+  only the bytes appended since, and only complete lines, so a record is never split across two scans; a transcript
+  shorter than the cursor is rescanned from the start. A rule is injected again after a compaction record or **2MB of
+  transcript growth** since its last injection, a deliberately coarse fallback for silent context cleanup that can
+  discard earlier hook injections without a compaction record. Existing numeric state entries are treated as
+  pre-compaction metrics and migrate on their next injection.
 
 ### Why per-session files (not a shared file)
-Multiple Claude Code sessions run concurrently (different terminals, Cursor + CLI, etc.). A shared state file with read-modify-write has a
+Multiple sessions run concurrently (different terminals, Cursor + CLI, etc.). A shared state file with read-modify-write has a
 race condition: session A reads, session B reads, A writes, B writes, and A's dedup tracking is lost. Per-session files eliminate this.
 
 ## Known Pitfalls
 
 ### Subagents run the same hooks
-Claude Code fires the tool hooks inside subagents too, with `agent_id` and `agent_type` in the input, and the state is
-keyed by session, so a rule injected into a subagent would be recorded as delivered and withheld from the main
-thread afterwards. The Claude hooks therefore do nothing when `agent_id` is present (`rule-common/main-thread?`).
-Codex marks nothing on a subagent's tool events and gives them the parent's session id, so the same confusion stands
-there and cannot be detected; the README lists it as a gap. Injecting into subagents with a history of their own is a
-possible follow-up.
+Claude Code fires the tool hooks inside subagents too, with the agent id on the event, and the state is keyed by
+session, so a rule injected into a subagent would be recorded as delivered and withheld from the main thread afterwards.
+The mod's tool hooks return the result untouched when `e.agentId` is set, and `mod.bb` selects nothing when its input
+carries `agent_id` (`rule-common/main-thread?`). Codex marks nothing on a subagent's tool events and gives them the
+parent's session id, so the same confusion stands there and cannot be detected; the README lists it as a gap. Injecting
+into subagents with a history of their own is a possible follow-up.
 
 ### Hooks run in the session `cwd`, which follows the Bash tool's shell
-Claude Code spawns hook commands in the session's current working directory, and that directory moves when the agent's
-Bash tool runs `cd`. Codex runs hooks in the session cwd too. Nothing in the hooks may resolve a relative path against
-the cwd: the Claude adapter takes the project root from `CLAUDE_PROJECT_DIR`, the Codex adapter walks up from the cwd
-to the nearest `.git` entry, and the wrapper passes the plugin's `bb.edn` explicitly. Running sessions capture hook config at
-startup; after installing or updating the plugin, restart the session or review `/hooks`.
+Claude Code's session working directory moves when the agent's Bash tool runs `cd`; the mod runs `mod.bb` there and
+hands it `$.session.root()` as `CLAUDE_PROJECT_DIR`. Codex runs hooks in the session cwd too. Nothing in the hooks may
+resolve a relative path against the cwd: the Claude adapter takes the project root from `CLAUDE_PROJECT_DIR`, the Codex
+adapter walks up from the cwd to the nearest `.git` entry, and the wrapper passes the plugin's `bb.edn` explicitly.
+Running sessions capture hook config at startup; after installing or updating the plugin, restart the session or run
+`/reload-plugins`.
 
-### Claude `transcript_path` from hook input is unreliable
-Claude Code bugs (#3046, #8710, #13668) cause `transcript_path` to be stale, wrong, or point to non-existent files after `/clear`,
-compaction, or in long sessions. The hooks locate the transcript by its globally unique `session_id` under the `projects/` directory of
-Claude's configuration directory (`~/.claude`, or `$CLAUDE_CONFIG_DIR` when set) instead of trusting `transcript_path` or reproducing
-Claude's undocumented project-directory encoding. Don't "simplify" this back to using the provided path.
-
-Codex hook input includes `transcript_path`; Codex hooks may use it. Keep the Claude workaround scoped to `hooks/claude`.
+### Claude Code reads no transcript
+The Claude Code adapter reads neither `transcript_path` nor the files under `~/.claude/projects`: the conversation the
+mod reads is what the model holds, after any compaction, and a fork's first prompt sees its inherited context there
+while its transcript file is still empty. Claude Code's `transcript_path` was also unreliable (#3046, #8710, #13668).
+Codex hook input includes `transcript_path` and the Codex adapter uses it.
 
 ### File edits can target another checkout, and the project need not be the checkout root
 Sessions edit absolute paths in linked worktrees, which Claude Code keeps under `.claude/worktrees/` inside the
@@ -195,70 +208,69 @@ the edited file, less the project's own position inside its checkout.
 ### Edits made through the shell are detected after the command, not before
 The edit hooks see only the paths a tool input names. A file written by a Bash command (a heredoc, `sed -i`, `tee`, `mv`,
 an interpreter one-liner) reaches no edit hook, and Claude Code's auto mode nudges the model towards exactly that: in
-auto-mode transcripts at least one source edit in five went through the shell. The shell hook (`hooks/claude/shell.bb`
-on `PostToolUse` and `PostToolUseFailure` for `Bash`; `hooks/codex/post_edit.bb` when `tool_name` is `Bash`, which is
-the name both harnesses give the shell tool) closes that gap after the fact: `rule-fairy.changes` lists the `git status`
-entries whose modification or inode change time is at or after the session's last shell check, and the matching rules
-are injected with the post-edit contract. The check is
-the marker the prompt hook starts and every shell check advances; paths stay pending in the session state until their
-rules were delivered (on Claude once every lane of the batch has acknowledged its frame, on Codex once the injection is
+auto-mode transcripts at least one source edit in five went through the shell. The shell hook (the mod's `tool.call`
+hook on Bash; `hooks/codex/post_edit.bb` when `tool_name` is `Bash`, which is the name both harnesses give the shell
+tool) closes that gap after the fact: `rule-fairy.changes` lists the `git status` entries whose modification or inode
+change time is at or after the session's last shell check, and the matching rules are injected with the post-edit
+contract. The check is the marker the prompt hook starts and every shell check advances; paths stay pending in the
+session state until their rules were delivered (on Claude once the delivery is attached, on Codex once the injection is
 prepared) and are otherwise retried by the next shell command, so a broken rule or a delivery cut short is retried
-rather than silently losing the edit, a rule set too large for the lanes arrives across successive commands, and a
-single rule too large for the lanes fails loudly on every command until it is fixed. Consequences to keep in mind: the rules arrive one model cycle after the
-write, never before it; a moved file counts through its inode change time, since `mv` keeps the modification time; times
-compare at whole seconds so a coarse filesystem cannot hide an edit; a write by another session between two checks is
-attributed to this one and injects its rules once; ignored files and deletions are never reported; only the working
-tree is read, so a commit, checkout, rebase or pull that moves HEAD brings nothing and a file written and committed in
-the same command is not seen; and outside a git checkout nothing is detected. The check is switched per harness by `:shell-hook` in `rule-fairy.edn`, on for Claude
-Code and off for Codex by default, because Codex makes many shell calls and rarely edits through them. Codex runs
-`PostToolUse` after a command that exits non-zero as well, with no separate failure event and no exit code in the
-input, so where the hook is on a write made before the failure is seen. `FileChanged` was not used because it delivers no context to the model and
-watches literal filenames only; a `Stop` safety net is unnecessary because context injected after the last shell call
-of a turn already reaches the model on that turn.
+rather than silently losing the edit, a rule set too large for one delivery arrives across successive commands, and a
+single rule too large for one delivery is reported on every command until it is fixed. Consequences to keep in mind:
+the rules arrive one model cycle after the write, never before it; a moved file counts through its inode change time,
+since `mv` keeps the modification time; times compare at whole seconds so a coarse filesystem cannot hide an edit; a
+write by another session between two checks is attributed to this one and injects its rules once; ignored files and
+deletions are never reported; only the working tree is read, so a commit, checkout, rebase or pull that moves HEAD
+brings nothing and a file written and committed in the same command is not seen; and outside a git checkout nothing is
+detected. The check is switched per harness by `:shell-hook` in `rule-fairy.edn`, on for Claude Code and off for Codex
+by default, because Codex makes many shell calls and rarely edits through them. The mod's Bash hook runs after a failed
+command as well, since `tool.call` resolves with the result either way; Codex runs `PostToolUse` after a command that
+exits non-zero too, with no separate failure event and no exit code in the input, so where the hook is on a write made
+before the failure is seen. `FileChanged` was not used because it delivers no context to the model and watches literal
+filenames only; a `Stop` safety net is unnecessary because context injected after the last shell call of a turn already
+reaches the model on that turn.
 
 ### Migrating from project-local hooks
 A repository that registered the original scripts in `.claude/settings.json` or `.codex/hooks.json` must remove those
 entries when the plugin is installed, or every rule is injected twice. To try a checkout of this repository as the plugin,
 add it as a local marketplace (`claude plugin marketplace add ./rule-fairy`) rather than pointing settings at its scripts.
 
-### Nil transcript size breaks dedup
+### Nil transcript size breaks dedup (Codex)
 When the transcript file doesn't exist yet (new session, test environment), `transcript-size` returns nil. If nil gets stored as the size,
 `needs-reinjection?` returns true on every subsequent call. The fix: `mark-injected!` stores `(or current-size 0)` to ensure a numeric value.
 
-### `needs-reinjection?` threshold direction
+### `needs-reinjection?` threshold direction (Codex)
 An earlier version checked `(< current-size stored-size)` to detect transcript shrinkage, but transcripts only grow. The correct check is
 `(>= (- current-size stored-size) threshold)` to re-inject after significant growth (2MB).
 
-### Context compaction does not shrink transcripts
+### Context compaction does not shrink transcripts (Codex)
 Codex records compaction in the transcript while the transcript file continues growing. Dedup therefore tracks the count of top-level
-`compacted` records and re-injects a matching rule after that count changes. Transcript size alone cannot detect context eviction.
-Claude transcripts expose compactions as `"isCompactSummary":true`; the Claude hooks track the count of those records equivalently.
-Claude can also clear older context without persisting a usable compaction boundary. Keep the 2MB transcript-growth fallback unless Claude
-exposes a reliable signal for that cleanup in the session transcript.
+`compacted` records and re-injects a matching rule after that count changes. Transcript size alone cannot detect context eviction, and
+Codex can also clear older context without a usable compaction record, which the 2MB transcript-growth fallback covers. Claude Code
+needs neither: the mod reads the conversation itself, where a compaction has replaced the compacted messages with its summary.
 
 ### Concurrent hook handlers and sessions
 The original design used a single `.mdc-injected-session.edn` for all sessions. Concurrent sessions (multiple terminals, Cursor + CLI) would
 race on read-modify-write, losing each other's dedup tracking. Fixed by switching to per-session files in `.rule-fairy/claude/`.
 
-Claude's Rule Fairy lanes also run concurrently inside one session. Batch creation, frame lookup, acknowledgements, and the final dedup update use a
-per-session file lock. Only the lane that creates a batch may read transcript metrics, and that read persists the scan cursor, so it must
-stay under the lock. Do not move those operations back into the event scripts or update session state from an individual frame.
+Claude Code runs tool calls side by side, so two deliveries of one session can run at once, each with a conversation read
+from before the other's result was recorded. `deliver!` reads the conversation's frames, the recent-delivery record and
+the pending shell paths, decides and records inside one `with-session-lock` call; the one-minute record is what makes the
+second delivery find the first. Do not move the decision or the record outside that call.
 
 Codex launches every hook matching an event concurrently, and a subagent's hooks carry the parent's session id, so
 its hooks contend for one state file too. Each Codex hook therefore reads the state, decides what to inject and
 records it inside one `with-session-lock` call, the same per-session file lock (`rule-fairy.session-state/with-lock`)
-the Claude lanes use, and prints its output after the lock is released. A helper that loads or saves session state
+the Claude adapter uses, and prints its output after the lock is released. A helper that loads or saves session state
 outside that call reintroduces the lost update.
 
 The glob cache is shared by every session of a project while the locks are per session, so it, like the session
-and batch files, is written through `rule-fairy.session-state/replace-file!`: a temporary file beside the target
-moved into place atomically. A plain truncating write lets a concurrent reader see partial EDN and fail its hook.
+files, is written through `rule-fairy.session-state/replace-file!`: a temporary file beside the target moved into place
+atomically. A plain truncating write lets a concurrent reader see partial EDN and fail its hook.
 
-The lanes' outputs land in the transcript in arrival order, not lane order, so a rule split across shards can read out of
-sequence; the `[rule-fairy shard n/m <delivery>]` labels are what lets the model reassemble it, and the delivery id is
-what lets the fork reader tell neighbouring deliveries apart. Anything that must read in order
-belongs in one shard, and per-lane commentary would either repeat on every lane or arrive scrambled. This has not caused
-trouble so far, and whether Claude guarantees any ordering for the hooks of one event is unchecked.
+A delivery's frames are attached together as one event's entries, in order. The `[rule-fairy shard n/m <delivery>]`
+labels are what lets a reader of the conversation group them, and the delivery id tells neighbouring deliveries apart;
+an entry without the header, such as an error entry, is never read as a delivery.
 
 ### Glob cache staleness
 The MDC glob cache is invalidated when an `.mdc` file or any directory in the rules tree is newer than the cache. Directory mtimes ensure
@@ -272,27 +284,30 @@ injected one. If it is too noisy, narrow the glob.
 
 ### Output format differs between agents and events
 - Codex hooks output JSON. Use `hookSpecificOutput.additionalContext` for reminders.
-- `hooks/claude/prompt.bb` (UserPromptSubmit): prints plain text to stdout
-- `hooks/claude/edit.bb` (PreToolUse): prints JSON with `hookSpecificOutput.additionalContext`
+- `hooks/claude/mod.bb` prints `{"context": [...]}` for the mod, which attaches the entries: on `prompt.submit` on the
+  way down, `next({ ...e, context })`, since a prompt's context cannot attach once the prompt has entered; on `tool.call`
+  on the result, `{ ...result, context }`. Claude Code renders each entry as a system reminder naming the event.
 
-Claude Code treats hook output differently per event type. Plain text becomes passive context; JSON enables structured control
-(`additionalContext`, `permissionDecision`, `updatedInput`). Don't make the Claude scripts match Codex without testing Claude behavior.
-
-Both Claude event types use the same batch protocol despite their different output encodings. Their commands must use the same script with
-distinct, contiguous `RULE_FAIRY_LANE` values from `0` through `11`. `rule_common_test.bb` checks the identities and lane set.
+Don't make the Claude scripts match Codex without testing Claude behavior. `mod-registration-test` in
+`hooks/claude/common_test.bb` checks that `hooks/hooks.json` names the module and registers no settings hooks beside it.
 
 ### Testing hooks locally
-`bb test` runs every suite, including install tests that execute the registered commands from `hooks/hooks.json` and
-`hooks/codex-hooks.json` through a shell against a temporary project. To run one hook by hand against a project:
+`bb test` runs every suite: the Claude hook suite runs `mod.bb` through `hooks/run` against a temporary project, the
+Codex suite runs the registered commands from `hooks/codex-hooks.json` through a shell, and `claude plugin test .` runs
+the mod's own tests (`hooks/claude/register.test.ts`), where the test answers the module's session, process and log
+calls, so no Babashka runs. `claude plugin validate .` lists the hooks and the calls the module makes. Loading the plugin
+once with `claude --plugin-dir .` makes Claude Code write its type declarations under `.claude-plugin/types/` (ignored);
+`bunx tsc -p tsconfig.json --noEmit` then type-checks the module and its tests. To run the entry script by hand against
+a project:
 
 ```bash
-# Claude prompt hook, lane 0, project root from CLAUDE_PROJECT_DIR
-echo '{"prompt":"fix the deftest","session_id":"test"}' \
-  | CLAUDE_PLUGIN_ROOT="$PWD" CLAUDE_PROJECT_DIR=/path/to/project RULE_FAIRY_LANE=0 hooks/run claude/prompt.bb
+# Claude prompt delivery, project root from CLAUDE_PROJECT_DIR
+echo '{"kind":"prompt","input":{"prompt":"fix the deftest","session_id":"test","in_context_frames":[]}}' \
+  | CLAUDE_PLUGIN_ROOT="$PWD" CLAUDE_PROJECT_DIR=/path/to/project hooks/run claude/mod.bb
 
-# Claude edit hook, lane 0
-echo '{"session_id":"test","tool_input":{"file_path":"/path/to/project/src/file.clj"}}' \
-  | CLAUDE_PLUGIN_ROOT="$PWD" CLAUDE_PROJECT_DIR=/path/to/project RULE_FAIRY_LANE=0 hooks/run claude/edit.bb
+# Claude edit delivery
+echo '{"kind":"edit","input":{"session_id":"test","tool_name":"Edit","tool_input":{"file_path":"/path/to/project/src/file.clj"}}}' \
+  | CLAUDE_PLUGIN_ROOT="$PWD" CLAUDE_PROJECT_DIR=/path/to/project hooks/run claude/mod.bb
 
 # Codex prompt and post-edit hooks, run from the project root
 (cd /path/to/project && echo '{"prompt":"fix the deftest","session_id":"test","cwd":"'"$PWD"'"}' \
@@ -301,7 +316,8 @@ echo '{"session_id":"test","tool_input":{"file_path":"/path/to/project/src/file.
   | PLUGIN_ROOT=/path/to/rule-fairy /path/to/rule-fairy/hooks/run codex/post_edit.bb)
 ```
 
-A single Claude lane prints one frame; complete multi-lane delivery and dedup are exercised by `bb test`.
+The entry script prints the context entries as JSON; attaching them and reading the conversation back is the module's
+part, exercised by `claude plugin test`.
 
 ## Adding a New Rule
 

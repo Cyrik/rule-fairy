@@ -27,19 +27,18 @@
 ;; exits before touching state records nothing. hooks/run exports the root.
 (def ^:private plugin-root-recorded
   (delay (session-state/record-plugin-root! state-dir (System/getenv "RULE_FAIRY_PLUGIN_ROOT"))))
-;; Transcripts live under Claude Code's configuration directory, which
-;; CLAUDE_CONFIG_DIR relocates as a whole.
-(def claude-projects-dir
-  (str (io/file (or (System/getenv "CLAUDE_CONFIG_DIR")
-                    (str (System/getProperty "user.home") "/.claude"))
-                "projects")))
-(def reinjection-threshold-bytes session-state/reinjection-threshold-bytes)
-(def completion-marker-ttl-ms (* 30 1000))
-(def hook-lane-count 12)
-(def max-hook-context-chars 9000)
+(def max-frame-chars
+  "Characters one frame of a delivery, one context entry of the mod
+  (hooks/claude/register.ts), may carry: Claude Code reads an entry whole
+  up to 100,000 characters and hands the model a head and a file path past
+  that."
+  100000)
+(def max-frames-per-delivery
+  "Frames one delivery may carry: Claude Code reads one event's entries
+  together up to 200,000 characters, two frames of max-frame-chars."
+  2)
 (def ^:private frame-header-reserve 64)
 (def ^:private frame-separator "\n\n---\n\n")
-(def ^:private compaction-pattern #"\"isCompactSummary\"\s*:\s*true")
 
 (defn main-thread?
   "Whether the hook fires in the session's main conversation. Claude Code
@@ -89,12 +88,6 @@
          "Apply these rules on the next pass over this change. "
          "If the completed change conflicts with them, revise it before moving on.")))
 
-(defn transcript-file [session-id]
-  (some (fn [project-directory]
-          (let [file (io/file project-directory (str session-id ".jsonl"))]
-            (when (.isFile file) file)))
-        (.listFiles (io/file claude-projects-dir))))
-
 (defn ensure-state-dir! []
   (session-state/ensure-dir! state-dir))
 
@@ -104,36 +97,10 @@
 (defn save-session-state! [session-id state]
   (session-state/save-state! state-dir session-id state))
 
-(defn transcript-metrics!
-  "Current metrics for the session transcript, scanning only what grew since
-  the last call. Nil when no transcript exists yet. Call under the session lock."
-  [session-id]
-  (session-state/transcript-metrics! state-dir session-id (transcript-file session-id) compaction-pattern))
-
-(defn needs-reinjection? [state rule-name current-metrics]
-  (session-state/needs-reinjection? state rule-name current-metrics))
-
-(defn mark-injected! [session-id state rule-names current-metrics]
-  (session-state/mark-injected! state-dir session-id state rule-names current-metrics))
-
 (defn event-id [event-kind input]
   (let [digest (doto (MessageDigest/getInstance "SHA-256")
                  (.update (.getBytes (str (name event-kind) "\n" input) "UTF-8")))]
     (format "%064x" (BigInteger. 1 (.digest digest)))))
-
-(defn hook-lane-index []
-  (let [configured-lane (System/getenv "RULE_FAIRY_LANE")
-        lane-index (some-> configured-lane parse-long)]
-    (when-not (and lane-index
-                   (<= 0 lane-index)
-                   (< lane-index hook-lane-count))
-      (throw (ex-info (str "Set RULE_FAIRY_LANE to an integer from 0 through "
-                           (dec hook-lane-count))
-                      {:configured-lane configured-lane})))
-    lane-index))
-
-(defn- batch-file-for [session-id event-id]
-  (str state-dir "/batches/" session-id "/" event-id ".edn"))
 
 (defn- with-session-lock [session-id f]
   @plugin-root-recorded
@@ -170,42 +137,13 @@
     paths))
 
 (defn shell-delivered!
-  "Clears paths from the session's pending shell changes once every lane has
-  delivered their rules, or nothing needed delivering. Call under the session
+  "Clears paths from the session's pending shell changes once their rules
+  have been delivered, or nothing needed delivering. Call under the session
   lock."
   [session-id paths]
   (save-session-state! session-id (changes/delivered (load-session-state session-id) paths)))
 
-;;; Injection batches
-
-(defn- load-batch [session-id event-id]
-  (let [file (io/file (batch-file-for session-id event-id))]
-    (when (.isFile file)
-      (edn/read-string (slurp file)))))
-
-(defn- save-batch! [session-id event-id batch]
-  (let [path (batch-file-for session-id event-id)]
-    (io/make-parents path)
-    (session-state/replace-file! path (pr-str batch))))
-
-(defn- delete-batch! [session-id event-id]
-  (.delete (io/file (batch-file-for session-id event-id))))
-
-(defn- finished-batch []
-  {:frames []
-   :acknowledged #{}
-   :commit? false
-   :finished-at (System/currentTimeMillis)})
-
-(defn- current-batch [session-id event-id]
-  (when-let [batch (load-batch session-id event-id)]
-    (if (and (:finished-at batch)
-             (>= (- (System/currentTimeMillis) (:finished-at batch))
-                 completion-marker-ttl-ms))
-      (do
-        (delete-batch! session-id event-id)
-        nil)
-      batch)))
+;;; Deliveries
 
 (defn- fits-frame? [pieces addition max-chars]
   (<= (+ (reduce + (map count pieces))
@@ -228,69 +166,42 @@
 
 (defn delivery-id
   "The identity a delivery's shard headers carry, so a reader of the
-  transcript can tell one delivery's shards from its neighbours' whatever
-  order the lanes finished in: the leading part of the event id the lanes
-  share. Twelve hex digits tell the deliveries of one transcript apart; this
-  is not a global identifier."
+  conversation can tell one delivery's frames from its neighbours': the
+  leading part of the event id. Twelve hex digits tell the deliveries of
+  one session apart; this is not a global identifier."
   [event-id]
   (subs event-id 0 (min 12 (count event-id))))
 
 (defn injection-frames
-  "The frames of one delivery: each opens with `[rule-fairy shard i/n <id>]`,
-  the first carries the prefix, and the rule and documentation pieces are
-  packed in order under the frame limit, max-hook-context-chars unless
-  max-chars says otherwise."
-  ([rule-names prefix delivery-id]
-   (injection-frames rule-names prefix delivery-id max-hook-context-chars))
-  ([rule-names prefix delivery-id max-chars]
-   (let [first-frame-body-limit (- max-chars (count prefix) frame-header-reserve)
-         later-frame-body-limit (- max-chars frame-header-reserve)]
-     (when-not (pos? first-frame-body-limit)
-       (throw (ex-info "Hook context prefix exceeds the frame limit"
-                       {:prefix-chars (count prefix)
-                        :max-chars max-chars})))
-     (let [pieces (mapcat #(rules/split-block % first-frame-body-limit)
-                          (render-rule-blocks rule-names))
-           frame-body-limit-fn #(if (zero? %)
-                                  first-frame-body-limit
-                                  later-frame-body-limit)
-           packed-frames (pack-frame-pieces pieces frame-body-limit-fn)
-           frame-count (count packed-frames)
-           frames (mapv (fn [index frame-pieces]
-                          (str "[rule-fairy shard " (inc index) "/" frame-count " " delivery-id "]\n"
-                               (when (zero? index) (str prefix "\n\n"))
-                               (str/join frame-separator frame-pieces)))
-                        (range frame-count)
-                        packed-frames)]
-       (doseq [frame frames]
-         (when (> (count frame) max-chars)
-           (throw (ex-info "Hook context frame exceeds the configured limit"
-                           {:frame-chars (count frame)
-                            :max-chars max-chars}))))
-       frames))))
-
-(defn lane-limits
-  "What one settings-hook delivery may carry: a frame per lane, each under
-  the hook output cap. Read at each call, so a test can change the lane
-  count."
-  []
-  {:max-chars max-hook-context-chars
-   :max-frames hook-lane-count
-   :over-frames-reason (fn [frame-count]
-                         (str "needs " frame-count " output frames, but only "
-                              hook-lane-count " lanes are configured"))})
-
-(def mod-limits
-  "What one mod delivery may carry (the Claude Code mod is
-  hooks/claude/register.ts, one process per event): Claude Code reads a
-  context entry whole up to 100,000 characters and one event's entries
-  together up to 200,000, handing the model a head and a file path past
-  either, so a delivery is at most two entries of that size."
-  {:max-chars 100000
-   :max-frames 2
-   :over-frames-reason (fn [frame-count]
-                         (str "needs " frame-count
-                              " context entries, but one delivery carries two"))})
+  "The frames of one delivery, each one context entry: each opens with
+  `[rule-fairy shard i/n <id>]`, the first carries the prefix, and the rule
+  and documentation pieces are packed in order under max-frame-chars."
+  [rule-names prefix delivery-id]
+  (let [first-frame-body-limit (- max-frame-chars (count prefix) frame-header-reserve)
+        later-frame-body-limit (- max-frame-chars frame-header-reserve)]
+    (when-not (pos? first-frame-body-limit)
+      (throw (ex-info "Hook context prefix exceeds the frame limit"
+                      {:prefix-chars (count prefix)
+                       :max-chars max-frame-chars})))
+    (let [pieces (mapcat #(rules/split-block % first-frame-body-limit)
+                         (render-rule-blocks rule-names))
+          frame-body-limit-fn #(if (zero? %)
+                                 first-frame-body-limit
+                                 later-frame-body-limit)
+          packed-frames (pack-frame-pieces pieces frame-body-limit-fn)
+          frame-count (count packed-frames)
+          frames (mapv (fn [index frame-pieces]
+                         (str "[rule-fairy shard " (inc index) "/" frame-count " " delivery-id "]\n"
+                              (when (zero? index) (str prefix "\n\n"))
+                              (str/join frame-separator frame-pieces)))
+                       (range frame-count)
+                       packed-frames)]
+      (doseq [frame frames]
+        (when (> (count frame) max-frame-chars)
+          (throw (ex-info "Hook context frame exceeds the configured limit"
+                          {:frame-chars (count frame)
+                           :max-chars max-frame-chars}))))
+      frames)))
 
 (defn- deferred-line [rule-names]
   (str "[rule-fairy deferred: " (str/join ", " rule-names)
@@ -307,30 +218,30 @@
   (contains? (ex-data error) :expanded-bytes))
 
 (defn- fitting-delivery
-  "The longest prefix of rule-names, in match order, that fits one delivery
-  under limits (lane-limits or mod-limits): its frames within :max-frames
-  of :max-chars each and its documentation within the engine's budget, as
-  {:rule-names :frames :deferred}; the first frame's marker lines open with
-  the deferred rest. {:oversized name :reason text} when the first rule
-  alone fits neither. Every shorter attempt renders again, because the
-  documentation blocks merge across the rules delivered together. The
-  deferred line counts against the first frame's limit, which also bounds
-  every piece, so a rule that alone fills every frame is reported oversized
-  while others are deferred; that boundary is far above any real rule."
-  [rule-names prefix-fn delivery-id {:keys [max-chars max-frames over-frames-reason]}]
+  "The longest prefix of rule-names, in match order, that fits one delivery:
+  its frames within max-frames-per-delivery of max-frame-chars each and its
+  documentation within the engine's budget, as {:rule-names :frames
+  :deferred}; the first frame's marker lines open with the deferred rest.
+  {:oversized name :reason text} when the first rule alone fits neither.
+  Every shorter attempt renders again, because the documentation blocks
+  merge across the rules delivered together. The deferred line counts
+  against the first frame's limit, which also bounds every piece, so a rule
+  that alone fills every frame is reported oversized while others are
+  deferred; that boundary is far above any real rule."
+  [rule-names prefix-fn delivery-id]
   (loop [delivered-count (count rule-names)]
     (let [delivered (subvec rule-names 0 delivered-count)
           deferred (subvec rule-names delivered-count)
           prefix (cond->> (prefix-fn delivered)
                    (seq deferred) (str (deferred-line deferred) "\n"))
           {:keys [frames over-budget]} (try
-                                         {:frames (injection-frames delivered prefix delivery-id max-chars)}
+                                         {:frames (injection-frames delivered prefix delivery-id)}
                                          (catch clojure.lang.ExceptionInfo error
                                            (if (documentation-over-budget? error)
                                              {:over-budget (ex-data error)}
                                              (throw error))))]
       (cond
-        (and frames (<= (count frames) max-frames))
+        (and frames (<= (count frames) max-frames-per-delivery))
         {:rule-names delivered :frames frames :deferred deferred}
 
         (= 1 delivered-count)
@@ -338,169 +249,80 @@
          :reason (if over-budget
                    (str "expands to " (:expanded-bytes over-budget)
                         " bytes of documentation, over the " (:max-bytes over-budget) "-byte budget")
-                   (over-frames-reason (count frames)))}
+                   (str "needs " (count frames) " context entries, but one delivery carries "
+                        max-frames-per-delivery))}
 
         :else
         (recur (dec delivered-count))))))
 
-(defn- inherit-injections!
-  "The session state with the rules its context already holds, as
-  inherited-fn names them, marked at current-metrics, done while the session
-  has recorded no injection of its own: a forked session starts with its
-  parent's context but a fresh state file, so the first batch would deliver
-  again what the context already holds. The lanes read the names from the
-  session's transcript file; the mod reads them from the conversation."
-  [session-id state inherited-fn current-metrics]
-  (if (seq (:sizes state))
-    state
-    (if-let [rule-names (seq (inherited-fn))]
-      (mark-injected! session-id state rule-names current-metrics)
-      state)))
+(def recent-delivery-ms
+  "How long a delivery counts as held by the conversation before the
+  conversation shows it. Tool calls that run side by side read the
+  conversation before either result, with its context, is recorded, so a
+  rule delivered within this window is not delivered again; the window only
+  has to cover two tools finishing around the same time."
+  60000)
 
-(defn- transcript-injections
-  "The rules the session's transcript file shows as injected after its last
-  compaction summary; nil without a transcript yet."
-  [session-id]
-  (some-> (transcript-file session-id)
-          .toPath
-          (transcript/inherited-injections compaction-pattern)))
+(defn- recently-delivered? [state rule-name now-ms]
+  (when-let [delivered-at (get-in state [:delivered rule-name])]
+    (< (- now-ms delivered-at) recent-delivery-ms)))
 
-(defn- create-batch [session-id event-id matching-rules transcript-metrics-fn prefix-fn paths limits inherited-fn]
-  (let [matching-rules (vec (distinct matching-rules))]
-    (when (seq matching-rules)
-      (let [current-metrics (transcript-metrics-fn)
-            state (inherit-injections! session-id (load-session-state session-id) inherited-fn current-metrics)
-            new-rules (filterv #(needs-reinjection? state % current-metrics)
-                              matching-rules)]
-        (when (seq new-rules)
-          (let [{:keys [rule-names frames deferred oversized reason]}
-                (fitting-delivery new-rules prefix-fn (delivery-id event-id) limits)]
-            (if oversized
-              {:rule-names []
-               :paths (vec paths)
-               :current-metrics current-metrics
-               :frames [(oversized-rule-frame oversized reason)]
-               :acknowledged #{}
-               :commit? false}
-              ;; A delivery that defers rules keeps every path pending: the
-              ;; next shell command matches the same rules, finds the
-              ;; delivered ones recorded and delivers the rest.
-              {:rule-names rule-names
-               :paths (if (seq deferred) [] (vec paths))
-               :current-metrics current-metrics
-               :frames frames
-               :acknowledged #{}
-               :commit? true})))))))
-
-(defn- build-batch!
-  "Builds and saves the event's batch, clearing the selection's paths from
-  the pending shell changes when there is nothing to deliver. A failed build
-  saves a finished batch, so the other lanes stay quiet, and rethrows."
-  [session-id event-id transcript-metrics-fn selection-fn]
-  (try
-    (let [{:keys [matching-rules prefix-fn paths]} (selection-fn)
-          batch (or (create-batch session-id
-                                  event-id
-                                  matching-rules
-                                  transcript-metrics-fn
-                                  prefix-fn
-                                  paths
-                                  (lane-limits)
-                                  #(transcript-injections session-id))
-                    (finished-batch))]
-      (save-batch! session-id event-id batch)
-      (when (and (seq paths) (empty? (:frames batch)))
-        (shell-delivered! session-id paths))
-      batch)
-    (catch Exception error
-      (save-batch! session-id event-id (finished-batch))
-      (throw error))))
-
-(defn injection-frame-for-lane!
-  "The frame this lane delivers for the event, or nil. The first lane to
-  arrive builds the event's batch from selection-fn and saves it; the others
-  read it. selection-fn returns :matching-rules, :prefix-fn and, after a
-  shell command, :paths, the changed paths whose rules the event delivers:
-  they leave the pending shell changes at once when nothing needs
-  delivering and once every lane has acknowledged its frame otherwise. They
-  stay pending while a delivery defers rules to the next event, so the next
-  shell command delivers the rest, and while a single rule is too large for
-  the lanes, which fails loudly on every command until the rule is fixed."
-  [{:keys [session-id event-id lane-index transcript-metrics-fn selection-fn]}]
-  (with-session-lock
-    session-id
-    (fn []
-      (let [batch (or (current-batch session-id event-id)
-                      (build-batch! session-id event-id transcript-metrics-fn selection-fn))]
-        (when-not (contains? (:acknowledged batch) lane-index)
-          (when-let [frame (get (:frames batch) lane-index)]
-            {:event-id event-id
-             :frame-index lane-index
-             :frame frame}))))))
-
-(defn complete-injection-frame! [session-id event-id frame-index]
-  (with-session-lock
-    session-id
-    (fn []
-      (when-let [batch (load-batch session-id event-id)]
-        (when (get (:frames batch) frame-index)
-          (let [new-batch (update batch :acknowledged conj frame-index)]
-            (if (= (count (:frames new-batch))
-                   (count (:acknowledged new-batch)))
-              (do
-                (when (:commit? new-batch)
-                  (mark-injected! session-id
-                                  (load-session-state session-id)
-                                  (:rule-names new-batch)
-                                  (:current-metrics new-batch))
-                  (when (seq (:paths new-batch))
-                    (shell-delivered! session-id (:paths new-batch))))
-                (save-batch! session-id event-id (finished-batch)))
-              (save-batch! session-id event-id new-batch))))))))
-
-;;; One-process delivery, for the mod
+(defn- record-delivery!
+  "Saves now-ms as the delivery time of every rule name, under `:delivered`
+  in the session state."
+  [session-id rule-names now-ms]
+  (save-session-state! session-id
+                       (update (load-session-state session-id)
+                               :delivered merge (zipmap rule-names (repeat now-ms)))))
 
 (defn deliver!
-  "One delivery in one process, for the Claude Code mod
-  (hooks/claude/register.ts): the selection's matched rules not yet injected,
-  rendered and packed into context entries under mod-limits, recorded as
-  injected, and the shell paths cleared unless the delivery defers rules.
-  selection-fn is as for injection-frame-for-lane!. in-context-frames are
-  the Rule Fairy frames the mod read back from the conversation, each from
-  its shard header; a session that has recorded nothing yet, as after a
-  fork, starts with their rules marked as injected. {:context [entry ...]},
-  empty when nothing is due; an oversized rule's error is the one entry and
-  records nothing, as the lanes report it."
-  [{:keys [session-id event-id transcript-metrics-fn selection-fn in-context-frames]}]
+  "One delivery for one hook event of the Claude Code mod
+  (hooks/claude/register.ts): the selection's matched rules the model's
+  context does not hold, rendered and packed into context entries, recorded
+  as delivered, and the shell paths cleared unless the delivery defers
+  rules. A rule is delivered when no whole delivery of it is among
+  in-context-frames, the Rule Fairy frames the mod read back from the
+  conversation at this event, each from its shard header, and none was
+  recorded within recent-delivery-ms. A compaction empties the conversation
+  of past deliveries, so the next matching event delivers again, and a
+  forked session starts with what it inherited; no transcript file is read.
+  selection-fn returns :matching-rules, :prefix-fn, from the delivered rule
+  names to the first frame's marker lines and contract, and after a shell
+  command :paths, the changed paths whose rules the event delivers: they
+  leave the pending shell changes when nothing needs delivering and once
+  their rules are delivered. They stay pending while a delivery defers
+  rules to the next event, so the next shell command delivers the rest,
+  and while a single rule is too large for one delivery, which is reported
+  on every command until the rule is fixed. now-ms is the clock, the
+  current time unless given. {:context [entry ...]}, empty when nothing is
+  due; an oversized rule's error is the one entry and records nothing."
+  [{:keys [session-id event-id selection-fn in-context-frames now-ms]}]
   (with-session-lock
     session-id
     (fn []
       (let [{:keys [matching-rules prefix-fn paths]} (selection-fn)
-            batch (create-batch session-id
-                                event-id
-                                matching-rules
-                                transcript-metrics-fn
-                                prefix-fn
-                                paths
-                                mod-limits
-                                #(transcript/frames-injections in-context-frames))]
-        (cond
-          (nil? batch)
+            now-ms (or now-ms (System/currentTimeMillis))
+            in-context (set (transcript/frames-injections in-context-frames))
+            state (load-session-state session-id)
+            rule-names (->> (distinct matching-rules)
+                            (remove in-context)
+                            (remove #(recently-delivered? state % now-ms))
+                            vec)]
+        (if (empty? rule-names)
           (do (when (seq paths)
                 (shell-delivered! session-id paths))
               {:context []})
-
-          (:commit? batch)
-          (do (mark-injected! session-id
-                              (load-session-state session-id)
-                              (:rule-names batch)
-                              (:current-metrics batch))
-              (when (seq (:paths batch))
-                (shell-delivered! session-id (:paths batch)))
-              {:context (:frames batch)})
-
-          :else
-          {:context (:frames batch)})))))
+          (let [{delivered :rule-names :keys [frames deferred oversized reason]}
+                (fitting-delivery rule-names prefix-fn (delivery-id event-id))]
+            (if oversized
+              {:context [(oversized-rule-frame oversized reason)]}
+              (do (record-delivery! session-id delivered now-ms)
+                  ;; A delivery that defers rules keeps every path pending:
+                  ;; the next shell command matches the same rules, finds
+                  ;; the delivered ones recorded and delivers the rest.
+                  (when (and (seq paths) (empty? deferred))
+                    (shell-delivered! session-id paths))
+                  {:context frames}))))))))
 
 ;;; Edited paths and the glob cache
 

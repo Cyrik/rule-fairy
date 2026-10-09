@@ -1,15 +1,15 @@
 #!/usr/bin/env bb
 
 ;; Entry point of the Claude Code mod, hooks/claude/register.ts: one process
-;; per event, in place of the twelve lanes a settings hook needed. Reads
-;; {"kind": "prompt" | "edit" | "shell", "input": {...}} from stdin, where
-;; input carries the fields the settings hooks read from theirs (session_id,
-;; prompt, tool_name, tool_input, agent_id) plus in_context_frames, the
-;; heads of the Rule Fairy frames the mod found in the conversation, and
-;; prints {"context": [...]}: the context entries the mod attaches after the
-;; prompt or the tool result, none when nothing is due. The selections are
-;; those of prompt.bb, edit.bb and shell.bb; the delivery is
-;; rule-common/deliver!.
+;; per event. Reads {"kind": "prompt" | "edit" | "shell", "input": {...}}
+;; from stdin, where input carries the fields of Claude Code's hook input
+;; (session_id, prompt, tool_name, tool_input, agent_id) plus
+;; in_context_frames, the heads of the Rule Fairy frames the mod found in
+;; the conversation, and prints {"context": [...]}: the context entries the
+;; mod attaches after the prompt or the tool result, none when nothing is
+;; due. A prompt selects by keyword and alwaysApply, an edit by the edited
+;; path's globs, a shell command by the globs of the paths it changed; the
+;; delivery is rule-common/deliver!.
 
 (require '[rule-fairy.rules :as rules]
          '[cheshire.core :as json]
@@ -83,7 +83,6 @@
                     (:context (rule-common/deliver!
                                {:session-id session-id
                                 :event-id (rule-common/event-id (keyword kind) input-str)
-                                :transcript-metrics-fn #(rule-common/transcript-metrics! session-id)
                                 :selection-fn selection-fn
                                 :in-context-frames (vec (:in_context_frames input))})))]
       (println (json/generate-string {:context (vec context)})))))

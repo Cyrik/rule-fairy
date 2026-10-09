@@ -1,6 +1,6 @@
 {
   "name": "rule-fairy",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Repository rules and docs, delivered to your coding agent. Injects Cursor-style rules into Claude Code sessions by prompt keyword, edited path, or alwaysApply, with documentation imports and reinjection after compaction.",
   "author": {
     "name": "Lukas Domagala"
