@@ -672,6 +672,17 @@
           (is (str/includes? rendered "reuse components"))
           (is (not (str/includes? rendered "not imported"))))))))
 
+(deftest ignored-prompt-block-test
+  (with-temp-project
+    {".cursor/rules/widget.mdc" "---\npromptAnyOf: widget\nalwaysApply: false\n---\n# Widget rule\n"}
+    (fn [root]
+      (testing "a keyword inside a system block selects nothing"
+        (is (nil? (run-prompt-hook root "session" "<system>\nAdd the widget.\n</system>\nhello"))))
+      (testing "the task text after the block still selects"
+        (let [context (run-prompt-hook root "session" "<system>\nbe brief\n</system>\nadd a widget")]
+          (is (str/includes? context "[rule-fairy injected: widget.mdc]"))
+          (is (str/includes? context "[rule-fairy matched: keyword \"widget\"]")))))))
+
 (deftest plugin-root-recorded-test
   (with-temp-project
     {".cursor/rules/base.mdc" "---\nalwaysApply: true\n---\n# Base\n"}

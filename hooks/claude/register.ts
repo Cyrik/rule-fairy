@@ -6,9 +6,14 @@
 // result on tool.call. With the event goes the head of every Rule Fairy
 // frame the conversation already holds, read from the Messages API form of
 // the session, so a session that inherited its context, as a fork does,
-// starts knowing what is already delivered. A subagent's tool calls deliver
-// nothing, as the settings hooks delivered nothing there, and nor does a
-// prompt another agent or process composed. A delivery that fails, its
+// starts knowing what is already delivered. A subagent's tool calls are
+// read against the subagent's own conversation and recorded under its own
+// state, so each agent has its own history. A subagent's task is matched at
+// agent.spawn the way a prompt is, and what it selects is appended to the
+// task inside the reminder wrapper the engine gives hook context, since a
+// spawn has no context channel; the subagent's first event reads it back
+// from its own prompt. A prompt another agent or process composed delivers
+// nothing. A delivery that fails, its
 // process exiting non-zero or the hook itself throwing or timing out,
 // attaches one error entry naming the failure and logs a line to the
 // transcript, so the model and the person both see it, and the prompt or
@@ -16,7 +21,7 @@
 // context can attach any more, so a failure after that point is logged only.
 import type { EngineInterface, HookFailure, Register } from 'claude-code'
 
-type Kind = 'prompt' | 'edit' | 'shell'
+type Kind = 'prompt' | 'edit' | 'shell' | 'spawn'
 
 const EDIT_TOOL = /^(Edit|Write|MultiEdit|NotebookEdit)$|^mcp__.*(edit|write|patch)/
 
@@ -83,17 +88,35 @@ function hookFailure(error: HookFailure): string {
   return error.kind === 'timeout' ? 'timed out' : 'threw'
 }
 
+// The wrapper the model reads a hook's context in, written into a
+// subagent's task since a spawn has no context channel: the frame reader
+// finds these entries the way it finds the engine's.
+export function withSpawnContext(prompt: string, context: readonly string[]): string {
+  return [
+    prompt,
+    ...context.map(entry => `<system-reminder>\nagent.spawn hook additional context: ${entry}\n</system-reminder>`),
+  ].join('\n\n')
+}
+
+// One delivery: the event handed to mod.bb with the frame heads of the
+// conversation it is read against: the main conversation, a subagent's own
+// (agentId), or none when the context starts empty, as a fresh subagent's.
 async function deliver(
   $: EngineInterface,
   kind: Kind,
   input: Record<string, unknown>,
+  conversation?: { agentId?: string },
 ): Promise<readonly string[]> {
   const root = $.plugin.root
   const [sessionId, projectDir, cwd, messages] = await Promise.all([
     $.session.id(),
     $.session.root(),
     $.session.cwd(),
-    $.session.messages({ as: 'api' }),
+    conversation === undefined
+      ? []
+      : $.session.messages(
+          conversation.agentId === undefined ? { as: 'api' } : { as: 'api', agentId: conversation.agentId },
+        ),
   ])
   const ran = await $.process.run([`${root}/hooks/run`, 'claude/mod.bb'], {
     cwd,
@@ -133,28 +156,51 @@ function withFailure<R extends { deny?: string; context?: readonly string[] }>(
 export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     if (COMPOSED_BY_OTHERS.has(e.origin.kind)) return next(e)
-    const context = await deliver($, 'prompt', { prompt: e.text })
+    const context = await deliver($, 'prompt', { prompt: e.text }, {})
     return next(withContext(e, context))
   }).catch(($, e, next) => {
     const entry = reportFailure($, 'prompt', hookFailure(next.error), next.error.message ?? '')
     return next.called ? next(e) : next(withContext(e, [entry]))
   })
 
+  // A fork is read against the conversation it inherits; any other subagent
+  // starts empty. The record is keyed by the spawn's tool call, since the
+  // agent's id is assigned once the task is set.
+  on('agent.spawn', async ($, e, next) => {
+    const context = await deliver(
+      $,
+      'spawn',
+      { prompt: e.prompt, spawn_id: e.tool_use_id },
+      e.fork ? { agentId: e.parentAgentId } : undefined,
+    )
+    return context.length === 0 ? next(e) : next({ ...e, prompt: withSpawnContext(e.prompt, context) })
+  }).catch(($, e, next) => {
+    const entry = reportFailure($, 'spawn', hookFailure(next.error), next.error.message ?? '')
+    return next.called ? next(e) : next({ ...e, prompt: withSpawnContext(e.prompt, [entry]) })
+  })
+
   on('tool.call', { tool: EDIT_TOOL }, async ($, e, next) => {
     const result = await next(e)
-    if (e.agentId !== undefined || result.deny !== undefined) return result
+    if (result.deny !== undefined) return result
     const { tool, tool_use_id, agentId, ...toolInput } = e
-    const context = await deliver($, 'edit', { tool_name: tool, tool_input: toolInput })
+    const context = await deliver(
+      $,
+      'edit',
+      { tool_name: tool, tool_input: toolInput, agent_id: agentId },
+      { agentId },
+    )
     return withContext(result, context)
   }).catch(async ($, e, next) => withFailure($, 'edit', await next(e), next.error))
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const result = await next(e)
-    if (e.agentId !== undefined || result.deny !== undefined) return result
-    const context = await deliver($, 'shell', {
-      tool_name: 'Bash',
-      tool_input: { command: e.command },
-    })
+    if (result.deny !== undefined) return result
+    const context = await deliver(
+      $,
+      'shell',
+      { tool_name: 'Bash', tool_input: { command: e.command }, agent_id: e.agentId },
+      { agentId: e.agentId },
+    )
     return withContext(result, context)
   }).catch(async ($, e, next) => withFailure($, 'shell', await next(e), next.error))
 }

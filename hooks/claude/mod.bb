@@ -1,15 +1,16 @@
 #!/usr/bin/env bb
 
 ;; Entry point of the Claude Code mod, hooks/claude/register.ts: one process
-;; per event. Reads {"kind": "prompt" | "edit" | "shell", "input": {...}}
-;; from stdin, where input carries the fields of Claude Code's hook input
-;; (session_id, prompt, tool_name, tool_input, agent_id) plus
-;; in_context_frames, the heads of the Rule Fairy frames the mod found in
-;; the conversation, and prints {"context": [...]}: the context entries the
-;; mod attaches after the prompt or the tool result, none when nothing is
-;; due. A prompt selects by keyword and alwaysApply, an edit by the edited
-;; path's globs, a shell command by the globs of the paths it changed; the
-;; delivery is rule-common/deliver!.
+;; per event. Reads {"kind": "prompt" | "spawn" | "edit" | "shell", "input":
+;; {...}} from stdin, where input carries the fields of Claude Code's hook
+;; input (session_id, prompt, tool_name, tool_input, agent_id, spawn_id)
+;; plus in_context_frames, the heads of the Rule Fairy frames the mod found
+;; in the conversation, and prints {"context": [...]}: the context entries
+;; the mod attaches after the prompt or the tool result, or appends to a
+;; subagent's task, none when nothing is due. A prompt and a subagent's task
+;; at spawn select by keyword and alwaysApply, an edit by the edited path's
+;; globs, a shell command by the globs of the paths it changed; the delivery
+;; is rule-common/deliver!.
 
 (require '[rule-fairy.rules :as rules]
          '[cheshire.core :as json]
@@ -59,29 +60,30 @@
 (defn- selection
   "The event's selection, or nil when it delivers nothing: a prompt without
   text, an edit naming no file, a shell command while the shell check is
-  off, and any event inside a subagent."
-  [kind {:keys [session_id prompt tool_input] :as input}]
-  (when (rule-common/main-thread? input)
+  off."
+  [kind {:keys [prompt tool_input] :as input}]
+  (let [state-id (rule-common/state-id input)]
     (case kind
       "prompt" (when prompt
                  (when (rule-common/shell-hook-enabled?)
-                   (rule-common/ensure-shell-marker! session_id))
+                   (rule-common/ensure-shell-marker! state-id))
                  (prompt-selection prompt))
+      "spawn" (when prompt
+                (prompt-selection prompt))
       "edit" (when-let [file-path (or (:file_path tool_input)
                                       (:notebook_path tool_input)
                                       (:path tool_input))]
                (edit-selection (rule-common/get-relative-path file-path)))
       "shell" (when (rule-common/shell-hook-enabled?)
-                (shell-selection session_id)))))
+                (shell-selection state-id)))))
 
 (let [input-str (slurp *in*)]
   (when-not (str/blank? input-str)
     (let [{:keys [kind input]} (json/parse-string input-str true)
-          session-id (:session_id input)
-          selection-fn (when session-id (selection kind input))
+          selection-fn (when (:session_id input) (selection kind input))
           context (when selection-fn
                     (:context (rule-common/deliver!
-                               {:session-id session-id
+                               {:session-id (rule-common/state-id input)
                                 :event-id (rule-common/event-id (keyword kind) input-str)
                                 :selection-fn selection-fn
                                 :in-context-frames (vec (:in_context_frames input))})))]

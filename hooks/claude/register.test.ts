@@ -4,7 +4,7 @@
 // common_test.bb; these cover what the module does around it.
 import { expect, test } from 'claude-code/testing'
 import type { On, ProcessRunResult } from 'claude-code'
-import { failureEntry, frameHeads } from './register'
+import { failureEntry, frameHeads, withSpawnContext } from './register'
 
 const DELIVERED = '[rule-fairy shard 1/1 d1]\n[rule-fairy injected: a.mdc]\n\n# a.mdc\n\nbody'
 
@@ -34,12 +34,16 @@ type Run = { argv: readonly string[]; stdin: string | undefined }
 
 // A session the module can read, every process run answered by `answer`;
 // the runs made are collected.
-function session(on: On, answer: (run: Run) => { value: ProcessRunResult } | { deny: string }): Run[] {
+function session(
+  on: On,
+  answer: (run: Run) => { value: ProcessRunResult } | { deny: string },
+  messages: (read: unknown) => [] = () => [],
+): Run[] {
   const runs: Run[] = []
   on('session.id', () => ({ value: 'session-test' }))
   on('session.root', () => ({ value: '/project' }))
   on('session.cwd', () => ({ value: '/project/sub' }))
-  on('session.messages', () => ({ value: [] }))
+  on('session.messages', (_$, e) => ({ value: messages(e) }))
   on('ui.log', () => ({ value: undefined }))
   on('process.run', (_$, e) => {
     const run = { argv: e.argv, stdin: e.init?.stdin }
@@ -85,6 +89,101 @@ test('a hook that throws still attaches an error entry, through its catch handle
   const result = await $.tool.call({ tool: 'Bash', command: 'true' })
   expect(result.context?.length).toBe(1)
   expect((result.context?.[0] ?? '').startsWith('[rule-fairy error: shell delivery threw]\n')).toBe(true)
+})
+
+test("a subagent's tool call is delivered for, against the subagent's own conversation", async ($, on) => {
+  const reads: unknown[] = []
+  const runs = session(
+    on,
+    () => ({ value: PROCESS_DELIVERED }),
+    read => {
+      reads.push(read)
+      return []
+    },
+  )
+  on('tool.call', () => ({ result: 'written' }))
+  // The engine stamps the agent id on a subagent's calls; a call the test
+  // makes carries it the same way, spread in past the input's typing.
+  const inSubagent = { agentId: 'agent-7' }
+  const result = await $.tool.call({
+    tool: 'Write',
+    file_path: '/project/src/a.clj',
+    content: '(ns a)',
+    ...inSubagent,
+  })
+  expect(result.context).toEqual([DELIVERED])
+  const stdin = JSON.parse(runs[0]?.stdin ?? '{}')
+  expect(stdin.input.session_id).toBe('session-test')
+  expect(stdin.input.agent_id).toBe('agent-7')
+  expect(stdin.input.tool_input).toEqual({ file_path: '/project/src/a.clj', content: '(ns a)' })
+  expect(JSON.stringify(reads)).toContain('agent-7')
+})
+
+// A spawn as the engine stamps it before the hooks: the test gives the
+// whole event, since the harness fills nothing in.
+const spawn = (prompt: string, fork: boolean, parentAgentId?: string) =>
+  ({
+    tool_use_id: 'toolu-spawn-1',
+    prompt,
+    description: 'a task',
+    subagentType: fork ? 'fork' : 'general-purpose',
+    provider: { plugin: 'engine', tier: 'core' },
+    parentModel: 'claude-opus-5-5',
+    background: false,
+    fork,
+    ...(parentAgentId === undefined ? {} : { parentAgentId }),
+  }) as const
+
+test("a subagent's task is delivered for at spawn, appended to the task, read against no conversation", async ($, on) => {
+  const reads: unknown[] = []
+  const runs = session(
+    on,
+    () => ({ value: PROCESS_DELIVERED }),
+    read => {
+      reads.push(read)
+      return []
+    },
+  )
+  const started: string[] = []
+  on('agent.spawn', (_$, e) => {
+    started.push(e.prompt)
+    return { model: 'inherit', agentId: 'agent-9' }
+  })
+  const result = await $.agent.spawn(spawn('add a widget', false))
+  expect(result.agentId).toBe('agent-9')
+  expect(started).toEqual([withSpawnContext('add a widget', [DELIVERED])])
+  const stdin = JSON.parse(runs[0]?.stdin ?? '{}')
+  expect(stdin.kind).toBe('spawn')
+  expect(stdin.input.prompt).toBe('add a widget')
+  expect(stdin.input.spawn_id).toBe('toolu-spawn-1')
+  expect(stdin.input.in_context_frames).toEqual([])
+  expect(reads).toEqual([])
+})
+
+test("a fork's task is read against the conversation it inherits, its parent's", async ($, on) => {
+  const reads: unknown[] = []
+  const runs = session(
+    on,
+    () => ({ value: PROCESS_DELIVERED }),
+    read => {
+      reads.push(read)
+      return []
+    },
+  )
+  on('agent.spawn', () => ({ model: 'inherit', agentId: 'agent-10' }))
+  await $.agent.spawn(spawn('carry on', true, 'agent-3'))
+  expect(runs.length).toBe(1)
+  expect(reads.length).toBe(1)
+  expect(JSON.stringify(reads)).toContain('agent-3')
+})
+
+test("what a spawn appends to the task is what the frame reader finds in the subagent's prompt", () => {
+  const task = withSpawnContext('add a widget', [DELIVERED])
+  expect(task.startsWith('add a widget\n\n<system-reminder>\nagent.spawn hook additional context: [rule-fairy shard 1/1 d1]\n')).toBe(
+    true,
+  )
+  expect(frameHeads([{ role: 'user', content: task }])).toEqual(['[rule-fairy shard 1/1 d1]\n[rule-fairy injected: a.mdc]'])
+  expect(withSpawnContext('plain task', [])).toBe('plain task')
 })
 
 test('a prompt the person typed is delivered for, after the prompt', async ($, on) => {

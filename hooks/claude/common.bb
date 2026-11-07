@@ -40,14 +40,19 @@
 (def ^:private frame-header-reserve 64)
 (def ^:private frame-separator "\n\n---\n\n")
 
-(defn main-thread?
-  "Whether the hook fires in the session's main conversation. Claude Code
-  runs the same hooks inside subagents and marks their input with agent_id;
-  rules are not injected there: a subagent's context starts without the
-  main thread's rules, and an injection recorded there would count against
-  the session and suppress the rule for the main thread later."
-  [input]
-  (nil? (:agent_id input)))
+(defn state-id
+  "The key of the hook input's session state and lock: the session id in
+  the main conversation; inside a subagent, which Claude Code marks with
+  agent_id, the session id and the agent id joined by a dot, so the
+  subagent's deliveries are recorded apart from the main thread's and from
+  its sibling agents'. A spawn carries spawn_id, its tool call, because the
+  agent's id is assigned once the task is set; nothing reads that record
+  back, the subagent's first event finds the frames in its own prompt."
+  [{:keys [session_id agent_id spawn_id]}]
+  (cond
+    agent_id (str session_id "." agent_id)
+    spawn_id (str session_id ".spawn." spawn_id)
+    :else session_id))
 
 (defn render-rules [rule-names]
   (rules/render-rules rules-source rule-names))
@@ -293,9 +298,10 @@
   their rules are delivered. They stay pending while a delivery defers
   rules to the next event, so the next shell command delivers the rest,
   and while a single rule is too large for one delivery, which is reported
-  on every command until the rule is fixed. now-ms is the clock, the
-  current time unless given. {:context [entry ...]}, empty when nothing is
-  due; an oversized rule's error is the one entry and records nothing."
+  on every command until the rule is fixed. session-id is the state key,
+  state-id of the hook input. now-ms is the clock, the current time unless
+  given. {:context [entry ...]}, empty when nothing is due; an oversized
+  rule's error is the one entry and records nothing."
   [{:keys [session-id event-id selection-fn in-context-frames now-ms]}]
   (with-session-lock
     session-id

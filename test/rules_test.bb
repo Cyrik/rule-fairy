@@ -164,6 +164,48 @@
           (is (= [{:rule "base.mdc" :always-apply? true :keywords []}]
                  (rules/rules-for-prompt source "hello"))))))))
 
+(deftest ignored-prompt-blocks-test
+  (let [rules {".cursor/rules/base.mdc" "---\nalwaysApply: true\n---\n# Base"
+               ".cursor/rules/datomic.mdc" "---\npromptAnyOf: datomic\n---\n# Datomic"
+               ".cursor/rules/widget.mdc" "---\npromptAnyOf: widget\n---\n# Widget"}
+        matched (fn [root prompt]
+                  (mapv :rule (rules/rules-for-prompt (rules/project-rules-source root) prompt)))]
+    (with-temp-project
+      rules
+      (fn [root]
+        (testing "a keyword inside a system block selects nothing; the task text around it still does"
+          (is (= ["base.mdc" "widget.mdc"]
+                 (matched root "<system>\nUse datomic for storage.\n</system>\nAdd a widget"))))
+        (testing "an opening tag with attributes still closes the block, and the block leaves a word boundary"
+          (is (= ["base.mdc" "widget.mdc"]
+                 (matched root "<system role=\"orchestrator\">datomic</system>widget"))))
+        (testing "a block that never closes is not a block: its text is matched"
+          (is (= ["base.mdc" "datomic.mdc"]
+                 (matched root "<system>\nUse datomic"))))
+        (testing "a nested block of the same name ends at the outer closing tag, not the inner one"
+          (is (= ["base.mdc" "widget.mdc"]
+                 (matched root "<system>before <system>inner datomic</system> datomic</system> add a widget"))))
+        (testing "task text between two separate blocks still selects"
+          (is (= ["base.mdc" "widget.mdc"]
+                 (matched root "<system>datomic</system> add a widget <system>datomic</system>"))))
+        (testing "a closed block inside an opening tag that never closes is removed; the rest stays plain text"
+          (is (= ["base.mdc" "widget.mdc"]
+                 (matched root "<system>mention the widget <system>datomic</system>"))))))
+    (with-temp-project
+      (assoc rules "rule-fairy.edn" "{:prompt {:ignored-blocks []}}")
+      (fn [root]
+        (testing "an empty list matches the whole prompt"
+          (is (= ["base.mdc" "datomic.mdc" "widget.mdc"]
+                 (matched root "<system>datomic</system> widget"))))))
+    (with-temp-project
+      (assoc rules "rule-fairy.edn" "{:prompt {:ignored-blocks [\"instructions\"]}}")
+      (fn [root]
+        (testing "the configured names replace the default"
+          (is (= ["base.mdc" "widget.mdc"]
+                 (matched root "<instructions>datomic</instructions> widget")))
+          (is (= ["base.mdc" "datomic.mdc" "widget.mdc"]
+                 (matched root "<system>datomic</system> widget"))))))))
+
 (deftest prompt-match-reasons-test
   (is (= [] (rules/prompt-match-reasons [])))
   (is (= ["[rule-fairy matched: alwaysApply base.mdc, core.mdc]"]
@@ -187,11 +229,12 @@
       (fn [root]
         (is (= {:project-root (str root)
                 :dirs [(str (io/file root ".cursor/rules"))]
-                :extensions [".mdc"]}
+                :extensions [".mdc"]
+                :ignored-blocks ["system"]}
                (rules/project-rules-source root))))))
 
   (testing "a relative root normalises away the leading ./"
-    (is (= {:project-root "." :dirs [".cursor/rules"] :extensions [".mdc"]}
+    (is (= {:project-root "." :dirs [".cursor/rules"] :extensions [".mdc"] :ignored-blocks ["system"]}
            (rules/project-rules-source "."))))
 
   (testing "rule-fairy.edn adds directories and extensions"
@@ -200,8 +243,19 @@
       (fn [root]
         (is (= {:project-root (str root)
                 :dirs [(str (io/file root "docs/rules")) "/abs/elsewhere"]
-                :extensions [".md" ".mdc"]}
+                :extensions [".md" ".mdc"]
+                :ignored-blocks ["system"]}
                (rules/project-rules-source root))))))
+
+  (testing "rule-fairy.edn names the prompt blocks keyword matching ignores"
+    (doseq [[config ignored-blocks] [["{:prompt {:ignored-blocks [\"instructions\" \"system\"]}}" ["instructions" "system"]]
+                                     ["{:prompt {:ignored-blocks []}}" []]
+                                     ["{:prompt {}}" ["system"]]]]
+      (with-temp-project
+        {"rule-fairy.edn" config}
+        (fn [root]
+          (is (= ignored-blocks (:ignored-blocks (rules/project-rules-source root)))
+              config)))))
 
   (testing "invalid configuration fails with the file named"
     (doseq [[config message] [["[:not :a :map]" #"must contain a map"]
@@ -212,6 +266,10 @@
                               ["{:rules {:extensions [\"md\"]}}" #":extensions in rule-fairy.edn"]
                               ["{:rules {:extensions []}}" #":extensions in rule-fairy.edn"]
                               ["{:rules {:dir \"x\"}}" #"Unknown :rules keys in rule-fairy.edn: :dir"]
+                              ["{:prompt [:ignored-blocks]}" #":prompt in rule-fairy.edn must be a map"]
+                              ["{:prompt {:ignored-blocks \"system\"}}" #":prompt :ignored-blocks in rule-fairy.edn must be a vector of tag names"]
+                              ["{:prompt {:ignored-blocks [\"<system>\"]}}" #":prompt :ignored-blocks in rule-fairy.edn"]
+                              ["{:prompt {:blocks [\"system\"]}}" #"Unknown :prompt keys in rule-fairy.edn: :blocks"]
                               ["{:rule {:dirs [\"x\"]}}" #"Unknown keys in rule-fairy.edn: :rule"]]]
       (with-temp-project
         {"rule-fairy.edn" config}

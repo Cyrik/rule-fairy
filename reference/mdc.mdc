@@ -75,6 +75,8 @@ alwaysApply: false
 - **promptAnyOf**: Optional, comma-separated prompt terms. At least one term must match for Codex and Claude hooks to inject the rule.
 - **promptRequires**: Optional, comma-separated prompt terms. Every term must match in addition to `promptAnyOf`.
   These fields are repository hook extensions; Cursor does not use them to select rules.
+  Terms are not matched inside a closed `<system>` block of the prompt, so an orchestrator's instructions sent as the
+  prompt select no rule; `:prompt {:ignored-blocks [...]}` in `rule-fairy.edn` names the blocks.
 - **globs**: 
   - If a rule is only relevant in very specific situations, leave globs empty (omit the field entirely) so it's loaded only when applicable to the user request.
   

@@ -1,17 +1,17 @@
 (ns rule-fairy.config
   "The optional `rule-fairy.edn` at a project root. It holds one map; each
   namespace validates its own key (`:rules` for the rules source,
-  `:instructions` for harness instruction files, `:shell-hook` for the
-  per-harness shell check). This namespace reads the file and rejects keys
-  nobody handles, so a misspelt key fails instead of silently changing
-  nothing."
+  `:prompt` for prompt matching, `:instructions` for harness instruction
+  files, `:shell-hook` for the per-harness shell check). This namespace
+  reads the file and rejects keys nobody handles, so a misspelt key fails
+  instead of silently changing nothing."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]))
 
 (def config-file "rule-fairy.edn")
 
-(def ^:private known-keys #{:rules :instructions :shell-hook})
+(def ^:private known-keys #{:rules :prompt :instructions :shell-hook})
 
 (defn read-config
   "The parsed configuration map under project-root, or nil when the file is

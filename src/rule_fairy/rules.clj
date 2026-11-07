@@ -28,36 +28,52 @@
 ;; Where a project keeps its rules. The default is Cursor's layout, so a
 ;; repository that already has `.cursor/rules/**/*.mdc` needs no configuration.
 ;; A `rule-fairy.edn` at the project root can add or move directories and
-;; extensions:
+;; extensions, and name the prompt blocks keyword matching ignores:
 ;;
-;;   {:rules {:dirs [".cursor/rules" "docs/rules"] :extensions [".mdc" ".md"]}}
+;;   {:rules {:dirs [".cursor/rules" "docs/rules"] :extensions [".mdc" ".md"]}
+;;    :prompt {:ignored-blocks ["system"]}}
 
 (def default-rules-config
   {:dirs [".cursor/rules"]
    :extensions [".mdc"]})
+
+(def default-prompt-config
+  {:ignored-blocks ["system"]})
 
 (defn- string-list? [value each-ok?]
   (and (sequential? value)
        (seq value)
        (every? #(and (string? %) (each-ok? %)) value)))
 
-(defn project-rules-source
-  "The rules source for the project at project-root:
-  {:project-root path :dirs [path ...] :extensions [string ...]}. Directories
-  are resolved against the root. Reads the optional `rule-fairy.edn` there,
-  whose `:rules` map may set `:dirs` and `:extensions`."
-  [project-root]
-  (let [root (io/file project-root)
-        rules-config (:rules (config/read-config root))
-        _ (when (and (some? rules-config) (not (map? rules-config)))
-            (throw (ex-info (str ":rules in " config/config-file " must be a map")
-                            {:rules rules-config})))
-        unknown-keys (remove #{:dirs :extensions} (keys rules-config))
-        {:keys [dirs extensions]} (merge default-rules-config rules-config)]
+(defn- section-config
+  "The map under section-key of the project's `rule-fairy.edn` merged over
+  its defaults; fails when the section is not a map or names a key outside
+  the defaults."
+  [config section-key defaults]
+  (let [section (get config section-key)
+        _ (when (and (some? section) (not (map? section)))
+            (throw (ex-info (str section-key " in " config/config-file " must be a map")
+                            {section-key section})))
+        unknown-keys (remove (set (keys defaults)) (keys section))]
     (when (seq unknown-keys)
-      (throw (ex-info (str "Unknown :rules keys in " config/config-file ": "
+      (throw (ex-info (str "Unknown " section-key " keys in " config/config-file ": "
                            (str/join ", " unknown-keys))
                       {:keys (vec unknown-keys)})))
+    (merge defaults section)))
+
+(defn project-rules-source
+  "The rules source for the project at project-root:
+  {:project-root path :dirs [path ...] :extensions [string ...]
+   :ignored-blocks [tag ...]}. Directories are resolved against the root.
+  Reads the optional `rule-fairy.edn` there, whose `:rules` map may set
+  `:dirs` and `:extensions` and whose `:prompt` map may set
+  `:ignored-blocks`, the tag names of the prompt blocks keyword matching
+  ignores."
+  [project-root]
+  (let [root (io/file project-root)
+        config (config/read-config root)
+        {:keys [dirs extensions]} (section-config config :rules default-rules-config)
+        {:keys [ignored-blocks]} (section-config config :prompt default-prompt-config)]
     (when-not (string-list? dirs seq)
       (throw (ex-info (str ":rules :dirs in " config/config-file
                            " must be a non-empty vector of directory paths")
@@ -66,9 +82,16 @@
       (throw (ex-info (str ":rules :extensions in " config/config-file
                            " must be a non-empty vector of extensions with a leading dot, like [\".mdc\"]")
                       {:extensions extensions})))
+    (when-not (and (sequential? ignored-blocks)
+                   (every? #(and (string? %) (re-matches #"[A-Za-z][A-Za-z0-9_-]*" %))
+                           ignored-blocks))
+      (throw (ex-info (str ":prompt :ignored-blocks in " config/config-file
+                           " must be a vector of tag names, like [\"system\"]")
+                      {:ignored-blocks ignored-blocks})))
     {:project-root (str root)
      :dirs (mapv #(str (.normalize (.resolve (.toPath root) %))) dirs)
-     :extensions (vec extensions)}))
+     :extensions (vec extensions)
+     :ignored-blocks (vec ignored-blocks)}))
 
 ;;; Rule files and frontmatter
 
@@ -218,13 +241,41 @@
       {:rule rule-name
        :keywords (vec (concat any-hits required-hits))})))
 
+(defn- ignored-block-pattern
+  "A closed `<tag>...</tag>` block with no block of the same tag inside it,
+  so that nested blocks are removed inside out, one pass per level, and an
+  outer block ends at its own closing tag."
+  [tag]
+  (let [quoted (java.util.regex.Pattern/quote tag)]
+    (re-pattern (str "(?s)<" quoted "(?:\\s[^>]*)?>"
+                     "(?:(?!<" quoted "[\\s>])(?!</" quoted ">).)*"
+                     "</" quoted ">"))))
+
+(defn- without-ignored-blocks
+  "The prompt with every closed `<tag>...</tag>` block of the source's
+  ignored tags replaced by a space, nested blocks included, so an
+  orchestrator's instructions marked that way select no keyword rules while
+  the task text around them still does. An opening tag that never closes is
+  plain text, even around a closed block."
+  [prompt tags]
+  (reduce (fn [text tag]
+            (let [pattern (ignored-block-pattern tag)]
+              (loop [text text]
+                (let [stripped (str/replace text pattern " ")]
+                  (if (= stripped text)
+                    text
+                    (recur stripped))))))
+          prompt
+          tags))
+
 (defn rules-for-prompt
   "Returns the rules that apply to a prompt: every `alwaysApply` rule plus
-  every rule whose prompt trigger matches, in rule-name order. Each match is
-  {:rule name :always-apply? bool :keywords matched-terms}; a rule that is
-  always-on and also keyword-matched reports both."
+  every rule whose prompt trigger matches outside the source's ignored
+  blocks, in rule-name order. Each match is {:rule name :always-apply? bool
+  :keywords matched-terms}; a rule that is always-on and also
+  keyword-matched reports both."
   [source prompt]
-  (let [prompt-lower (str/lower-case prompt)]
+  (let [prompt-lower (str/lower-case (without-ignored-blocks prompt (:ignored-blocks source)))]
     (->> (rule-index source)
          (keep (fn [{:keys [rule-name always-apply? prompt-trigger]}]
                  (let [trigger-match (when prompt-trigger

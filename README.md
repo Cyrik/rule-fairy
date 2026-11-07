@@ -89,7 +89,10 @@ request also needs the GitHub CLI (`gh`), logged in.
   their documentation imports, and injects them with the prompt. On Claude
   Code a prompt the person did not write, such as a background task's
   report, another session's message or another plugin's prompt, selects
-  nothing: keyword rules match what the person asked.
+  nothing: keyword rules match what the person asked. For the same reason
+  text inside a `<system>` block is not matched on either harness: an
+  orchestrator that sends its instructions as the prompt marks them that
+  way. The block names are configurable (see Configuration).
 - **Edit hook** (Claude `tool.call` on Edit, Write, MultiEdit, NotebookEdit
   and MCP edit tools, Codex `PostToolUse`): matches the edited path against
   every rule's `globs` and injects the matches. On Claude Code the rules
@@ -252,6 +255,16 @@ Cursor's (`description`, `globs`, `alwaysApply`) plus the extensions
 `promptAnyOf` and `promptRequires`. The format is documented for rule authors
 in [reference/mdc.mdc](reference/mdc.mdc).
 
+The same file names the prompt blocks that keyword matching ignores. By
+default the text inside a closed `<system>` block selects no rule, since an
+orchestrator that drives the agent through the prompt marks its
+instructions that way; the task text around the block still matches. The
+list holds tag names, and an empty list matches the whole prompt:
+
+```clojure
+{:prompt {:ignored-blocks ["system" "instructions"]}}
+```
+
 The same file switches the shell hook per harness. It is on for Claude Code
 and off for Codex unless set:
 
@@ -390,6 +403,16 @@ tests against them.
 - Each harness keeps one dedup map per session shared by all of its hooks. A
   rule delivered after an edit is not delivered again by the next prompt, and
   the reverse. Codex previously kept separate prompt and post-edit buckets.
+- On Claude Code each agent of a session has its own deliveries. A
+  subagent's tool calls are matched against the subagent's own conversation
+  and recorded under its own state file, `<session>.<agent>.edn`, so a fork
+  starts with what it inherited, a fresh subagent starts empty, and neither
+  touches the main thread's history or a sibling's. A subagent's task is
+  matched at spawn the way a prompt is, always-on and keyword rules, and what
+  it selects is appended to the task inside the reminder wrapper hook
+  context uses, since a spawn has no context channel; a fork is matched
+  against what it inherits. A subagent's first shell command starts its own
+  shell check, as a session's first prompt does.
 - The code, labels, state paths and environment variables say "rule" and
   "rule-fairy"; "MDC" is Cursor's name for the default file format and appears
   only where that format is meant. The rules location is configuration, not
@@ -469,14 +492,11 @@ tests against them.
 
 ## Known gaps
 
-- **Subagents get no rules.** Claude Code runs the hooks inside subagents
-  and marks their input with the agent id; the hooks do nothing there. A
-  subagent's context has none of the main thread's rules, and an injection
-  recorded there would count against the session and suppress the rule for
-  the main thread later. Codex marks nothing on a subagent's tool events and
-  gives them the parent's session id, so there a subagent's injections do
-  count against the parent. Injecting into subagents with a history of their
-  own is a possible follow-up.
+- **Codex subagents share the parent's history.** Codex runs a subagent's
+  hooks under the parent's session id and marks nothing on its tool events,
+  so a subagent's deliveries are recorded against the parent and the
+  parent's against it: a rule one of them holds is withheld from the other.
+  On Claude Code each agent has its own history (see Design notes).
 - **Shell edits outside git.** The shell hook finds what a command wrote
   through `git status`, so in a directory that is not a checkout files
   written by shell commands get no rules. A walk comparing file times was

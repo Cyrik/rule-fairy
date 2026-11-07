@@ -355,15 +355,50 @@
     (fn [root]
       (let [edit #(run-edit-hook root %1 %2 %3)
             file (str (io/file root "src/a.clj"))]
-        (testing "inside a subagent the hook injects nothing and records nothing"
-          (is (nil? (edit "session-sub" {:file_path file} {:agent_id "agent-1" :agent_type "Explore"})))
+        (testing "inside a subagent the hook delivers and records under the agent's own state"
+          (is (str/includes? (edit "session-sub" {:file_path file} {:agent_id "agent-1" :agent_type "Explore"})
+                             "# Widget rule"))
+          (is (.exists (io/file root ".rule-fairy/claude/session-sub.agent-1.edn")))
           (is (not (.exists (io/file root ".rule-fairy/claude/session-sub.edn")))))
-        (testing "the main thread of the same session still gets the rule"
+        (testing "the subagent's delivery is not in the main thread's conversation, so the main thread gets the rule too"
           (is (str/includes? (edit "session-sub" {:file_path file} {}) "# Widget rule")))
+        (testing "a sibling subagent has a history of its own"
+          (is (str/includes? (edit "session-sub" {:file_path file} {:agent_id "agent-2"}) "# Widget rule")))
+        (testing "the first subagent's record withholds the rule from its next edit"
+          (is (nil? (edit "session-sub" {:file_path file} {:agent_id "agent-1"}))))
         (testing "an MCP edit naming its file as path selects rules too"
           (is (str/includes? (edit "session-mcp" {:path (str (io/file root "src/b.clj"))}
                                    {:tool_name "mcp__filesystem__write_file"})
                              "[rule-fairy matched: glob on src/b.clj]")))))))
+
+(deftest spawn-delivery-test
+  (with-temp-project
+    {".cursor/rules/base.mdc" "---\nalwaysApply: true\n---\n# Base rule\n"
+     ".cursor/rules/widget.mdc" "---\npromptAnyOf: widget\nalwaysApply: false\n---\n# Widget rule\n"}
+    (fn [root]
+      (let [spawn (fn [input]
+                    (mod-context "spawn" root root
+                                 (merge {:session_id "session" :spawn_id "toolu-1"} input)
+                                 {}))]
+        (testing "a fresh subagent's task selects the always-on and keyword rules like a prompt"
+          (let [context (spawn {:prompt "add a widget"})]
+            (is (str/includes? context "[rule-fairy injected: base.mdc]"))
+            (is (str/includes? context "[rule-fairy injected: widget.mdc]"))
+            (is (str/includes? context "[rule-fairy matched: alwaysApply base.mdc]"))
+            (is (str/includes? context "[rule-fairy matched: keyword \"widget\"]"))))
+        (testing "the record lands under the spawn's own key, never the session's"
+          (is (.exists (io/file root ".rule-fairy/claude/session.spawn.toolu-1.edn")))
+          (is (not (.exists (io/file root ".rule-fairy/claude/session.edn")))))
+        (testing "a fork is read against what it inherits and gets only what that lacks"
+          (let [context (spawn {:prompt "add a widget"
+                                :spawn_id "toolu-2"
+                                :in_context_frames (in-context "base.mdc")})]
+            (is (str/includes? context "[rule-fairy injected: widget.mdc]"))
+            (is (not (str/includes? context "injected: base.mdc")))))
+        (testing "a task that selects nothing new delivers nothing"
+          (is (nil? (spawn {:prompt "hello"
+                            :spawn_id "toolu-3"
+                            :in_context_frames (in-context "base.mdc")}))))))))
 
 (defn git! [root & args]
   (apply p/shell {:dir (str root) :out :string :err :string}
@@ -720,6 +755,17 @@
               (doseq [rule-stem ["x" "y" "z"]]
                 (is (str/includes? entry (rule-paragraph rule-stem 39))))
               (is (= #{"x.mdc" "y.mdc" "z.mdc"} (delivered-rules))))))))))
+
+(deftest ignored-prompt-block-test
+  (with-temp-project
+    {".cursor/rules/widget.mdc" "---\npromptAnyOf: widget\nalwaysApply: false\n---\n# Widget rule\n"}
+    (fn [root]
+      (testing "a keyword inside a system block selects nothing"
+        (is (str/blank? (run-prompt-hook root "session" "<system>\nAdd the widget.\n</system>\nhello"))))
+      (testing "the task text after the block still selects"
+        (let [context (run-prompt-hook root "session" "<system>\nbe brief\n</system>\nadd a widget")]
+          (is (str/includes? context "[rule-fairy injected: widget.mdc]"))
+          (is (str/includes? context "[rule-fairy matched: keyword \"widget\"]")))))))
 
 (deftest plugin-root-recorded-test
   (with-temp-project
