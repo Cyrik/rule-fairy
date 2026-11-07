@@ -104,8 +104,9 @@ alwaysApply: false
   
   **Performance note:** Rules with `alwaysApply: true` are always loaded, which can increase context size. Use globs when possible.
 
-  **Hook delivery:** The Codex and Claude prompt hooks inject always-on rules with the first prompt of a session and again
-  after compaction, labelled `[mdc-hook: alwaysApply ...]`. Keep such content out of `CLAUDE.md` and `AGENTS.md` so it is
+  **Hook delivery:** The Codex and Claude hooks inject always-on rules with the first event of a session, prompt or
+  edit, and again with the first event after compaction, labelled `[rule-fairy matched: alwaysApply ...]`. Keep such
+  content out of `CLAUDE.md` and `AGENTS.md` so it is
   not delivered twice.
 
 #### Description Examples

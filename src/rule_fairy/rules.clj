@@ -286,6 +286,14 @@
                       :keywords (or (:keywords trigger-match) [])}))))
          vec)))
 
+(defn always-on-reason
+  "The marker line naming the delivered `alwaysApply` rules, nil without
+  any. Every hook delivers always-on rules the context lacks, so the line
+  follows the event's own matched line."
+  [rule-names]
+  (when (seq rule-names)
+    (str "[rule-fairy matched: alwaysApply " (str/join ", " rule-names) "]")))
+
 (defn prompt-match-reasons
   "Marker lines saying why prompt matches were selected: one naming the
   `alwaysApply` rules and one listing the matched keywords, each only when
@@ -295,10 +303,111 @@
         keywords (distinct (mapcat :keywords matches))]
     (cond-> []
       (seq always-on)
-      (conj (str "[rule-fairy matched: alwaysApply " (str/join ", " (map :rule always-on)) "]"))
+      (conj (always-on-reason (map :rule always-on)))
 
       (seq keywords)
       (conj (str "[rule-fairy matched: keyword \"" (str/join "\", \"" keywords) "\"]")))))
+
+;;; Fitting a delivery
+
+(defn deferred-line
+  "The line a delivery opens with when it leaves rules for the next
+  matching event."
+  [rule-names]
+  (str "[rule-fairy deferred: " (str/join ", " rule-names)
+       " (past what one delivery can carry; delivered with the next matching event)]"))
+
+(defn oversized-rule-lines
+  "What a delivery consists of when its first rule alone cannot be
+  delivered: the error naming the rule and the reason, and the line telling
+  the model nothing was recorded."
+  [rule-name reason]
+  (str "[rule-fairy error: " rule-name " alone " reason "]\n"
+       "No matched rules were injected or marked as injected."))
+
+(defn- documentation-over-budget?
+  "True for the documentation budget error, which carries the byte counts.
+  Any other rendering error is a broken rule and stays an error."
+  [error]
+  (contains? (ex-data error) :expanded-bytes))
+
+(defn fit-delivery
+  "The longest prefix of rule-names, in match order, that one delivery can
+  carry. render-fn is called with the rules to deliver and the rest, which
+  the delivery's opening names as deferred, and answers {:rendered value}
+  or {:reason text} when the value is past what the harness delivers
+  whole; a documentation budget error thrown while rendering counts as
+  not fitting too. {:rule-names delivered :rendered value :deferred rest},
+  or {:oversized name :reason text} when the first rule alone does not
+  fit. Every shorter attempt renders again, because the documentation
+  blocks merge across the rules delivered together."
+  [rule-names render-fn]
+  (let [rule-names (vec rule-names)]
+    (loop [delivered-count (count rule-names)]
+      (let [delivered (subvec rule-names 0 delivered-count)
+            deferred (subvec rule-names delivered-count)
+            {:keys [rendered reason]}
+            (try
+              (render-fn delivered deferred)
+              (catch clojure.lang.ExceptionInfo error
+                (if (documentation-over-budget? error)
+                  (let [{:keys [expanded-bytes max-bytes]} (ex-data error)]
+                    {:reason (str "expands to " expanded-bytes
+                                  " bytes of documentation, over the " max-bytes "-byte budget")})
+                  (throw error))))]
+        (cond
+          (some? rendered) {:rule-names delivered :rendered rendered :deferred deferred}
+          (= 1 delivered-count) {:oversized (first delivered) :reason reason}
+          :else (recur (dec delivered-count)))))))
+
+;;; Post-edit deliveries
+
+(def post-edit-path-budget
+  "Characters the matched line of a post-edit delivery spends on naming the
+  changed paths: the leading paths that fit are named and the rest are
+  counted. Rules match by glob, so the names inform the agent without
+  deciding anything, and neither a rebase's hundreds of paths nor a few
+  very long ones may push the line past what a harness delivers whole."
+  1000)
+
+(defn- named-paths
+  "The leading paths whose names, comma-separated, fit the budget."
+  [paths]
+  (loop [named [] remaining paths used 0]
+    (if-let [path (first remaining)]
+      (let [used (+ used (count path) (if (seq named) 2 0))]
+        (if (<= used post-edit-path-budget)
+          (recur (conj named path) (rest remaining) used)
+          named))
+      named)))
+
+(defn post-edit-prefix
+  "The opening of a delivery made after an edit, the same on both
+  harnesses: the injected-rule markers, the matched line naming the leading
+  changed paths that fit post-edit-path-budget and counting the rest, with
+  `changed by a shell command` when :shell? is set and left out when no
+  path's rule is delivered, the line naming the :always-on rules among the
+  delivered, and the contract asking for the rules to be applied on the
+  next pass and the finished change revised where it conflicts."
+  [rule-names paths {:keys [shell? always-on]}]
+  (let [paths (vec paths)
+        named (named-paths paths)
+        rest-count (- (count paths) (count named))
+        matched (cond
+                  (empty? named) (str (count paths) " paths")
+                  (pos? rest-count) (str (str/join ", " named) " and " rest-count " more")
+                  :else (str/join ", " named))]
+    (str (str/join "\n"
+                   (remove nil?
+                           [(str/join "\n" (map #(str "[rule-fairy injected: " % "]") rule-names))
+                            (when (seq paths)
+                              (str "[rule-fairy matched: glob on " matched
+                                   (when shell? ", changed by a shell command")
+                                   "]"))
+                            (always-on-reason always-on)]))
+         "\n\n"
+         "Apply these rules on the next pass over this change. "
+         "If the completed change conflicts with them, revise it before moving on.")))
 
 ;;; Glob matching
 ;;

@@ -17,29 +17,27 @@
          '[clojure.string :as str])
 
 (defn prompt-output
-  "The hook output delivering the rules the prompt selected, or nil when
-  every one of them is already in context. Records the delivery in the
-  session state, so it runs under the session lock."
+  "The hook output delivering the rules the prompt selected, as far as one
+  delivery carries them, or nil when every one of them is already in
+  context. Records the delivery in the session state, so it runs under the
+  session lock."
   [session_id input matches]
   (let [current-metrics (rule-common/transcript-metrics! session_id input)
         state (rule-common/load-session-state session_id)
         new-matches (filter #(rule-common/needs-reinjection? state (:rule %) current-metrics)
-                            matches)]
+                            matches)
+        match-of (into {} (map (juxt :rule identity)) new-matches)]
     (when (seq new-matches)
-      (let [rule-names (map :rule new-matches)
-            contents (rule-common/prepare-injection! session_id
-                                                    state
-                                                    rule-names
-                                                    current-metrics)]
-        (when (seq contents)
-          {:hookSpecificOutput
-           {:hookEventName "UserPromptSubmit"
-            :additionalContext
-            (str (str/join "\n"
-                           (concat (map #(str "[rule-fairy injected: " % "]") rule-names)
-                                   (rules/prompt-match-reasons new-matches)))
-                 "\n\n"
-                 contents)}})))))
+      (let [{:keys [context]}
+            (rule-common/fitted-injection!
+             session_id state (map :rule new-matches) current-metrics
+             (fn [delivered]
+               (str/join "\n"
+                         (concat (map #(str "[rule-fairy injected: " % "]") delivered)
+                                 (rules/prompt-match-reasons (map match-of delivered))))))]
+        {:hookSpecificOutput
+         {:hookEventName "UserPromptSubmit"
+          :additionalContext context}}))))
 
 (let [{:keys [prompt session_id] :as input} (rule-common/read-json-stdin)]
   (when (and prompt session_id)

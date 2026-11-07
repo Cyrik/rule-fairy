@@ -206,6 +206,79 @@
           (is (= ["base.mdc" "datomic.mdc" "widget.mdc"]
                  (matched root "<system>datomic</system> widget"))))))))
 
+(deftest fit-delivery-test
+  (let [budget-error (ex-info "over" {:expanded-bytes 70000 :max-bytes 65536})
+        joined (fn [delivered _] {:rendered (str/join "+" delivered)})]
+    (testing "the whole set when it fits, nothing deferred"
+      (is (= {:rule-names ["a" "b"] :rendered "a+b" :deferred []}
+             (rules/fit-delivery ["a" "b"] joined))))
+    (testing "the longest prefix the renderer accepts, the rest deferred, each attempt rendered with its own rest"
+      (let [attempts (atom [])]
+        (is (= {:rule-names ["a" "b"] :rendered "a+b" :deferred ["c" "d"]}
+               (rules/fit-delivery ["a" "b" "c" "d"]
+                                   (fn [delivered deferred]
+                                     (swap! attempts conj [(vec delivered) (vec deferred)])
+                                     (if (> (count delivered) 2)
+                                       {:reason "too many"}
+                                       (joined delivered deferred))))))
+        (is (= [[["a" "b" "c" "d"] []] [["a" "b" "c"] ["d"]] [["a" "b"] ["c" "d"]]] @attempts))))
+    (testing "the documentation budget error counts as not fitting"
+      (is (= {:rule-names ["a"] :rendered "a" :deferred ["b"]}
+             (rules/fit-delivery ["a" "b"] (fn [delivered deferred]
+                                             (if (> (count delivered) 1)
+                                               (throw budget-error)
+                                               (joined delivered deferred)))))))
+    (testing "the first rule alone not fitting is oversized, with the renderer's reason or the budget's"
+      (is (= {:oversized "a" :reason "needs 3 context entries"}
+             (rules/fit-delivery ["a" "b"] (fn [_ _] {:reason "needs 3 context entries"}))))
+      (is (= {:oversized "a" :reason "expands to 70000 bytes of documentation, over the 65536-byte budget"}
+             (rules/fit-delivery ["a"] (fn [_ _] (throw budget-error))))))
+    (testing "any other rendering error propagates"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"missing import"
+                            (rules/fit-delivery ["a"] (fn [_ _] (throw (ex-info "missing import" {})))))))))
+
+(deftest post-edit-prefix-test
+  (let [shell {:shell? true}]
+    (testing "paths that fit the budget are named in full, with the shell marker and the contract"
+      (let [paths (mapv #(str "src/file-" % ".clj") (range 25))
+            prefix (rules/post-edit-prefix ["a.mdc" "b.mdc"] paths shell)]
+        (is (str/starts-with? prefix "[rule-fairy injected: a.mdc]\n[rule-fairy injected: b.mdc]\n[rule-fairy matched: glob on src/file-0.clj, "))
+        (is (str/includes? prefix "src/file-24.clj, changed by a shell command]\n\nApply these rules on the next pass over this change. "))
+        (is (str/ends-with? prefix "revise it before moving on."))
+        (is (not (str/includes? prefix " more")))))
+    (testing "an edit through a tool carries no shell marker"
+      (let [prefix (rules/post-edit-prefix ["a.mdc"] ["src/a.clj" "src/b.clj"] {})]
+        (is (str/includes? prefix "[rule-fairy matched: glob on src/a.clj, src/b.clj]\n\n"))
+        (is (not (str/includes? prefix "shell")))))
+    (testing "always-on rules among the delivered get their line after the glob line"
+      (is (str/starts-with? (rules/post-edit-prefix ["a.mdc" "base.mdc"] ["src/a.clj"] {:always-on ["base.mdc"]})
+                            "[rule-fairy injected: a.mdc]\n[rule-fairy injected: base.mdc]\n[rule-fairy matched: glob on src/a.clj]\n[rule-fairy matched: alwaysApply base.mdc]\n\nApply")))
+    (testing "with no path's rule delivered the glob line is left out"
+      (is (str/starts-with? (rules/post-edit-prefix ["base.mdc"] [] {:shell? true :always-on ["base.mdc"]})
+                            "[rule-fairy injected: base.mdc]\n[rule-fairy matched: alwaysApply base.mdc]\n\nApply")))
+    (testing "the leading paths that fit are named, the rest counted: 60-character paths, 16 fit in 1,000"
+      (let [paths (mapv #(str "src/" (apply str (repeat 48 "x")) "/f" (format "%02d" %) ".clj") (range 30))
+            prefix (rules/post-edit-prefix ["a.mdc"] paths shell)]
+        (is (every? #(= 60 (count %)) paths))
+        (is (str/includes? prefix "/f15.clj and 14 more, changed by a shell command]"))
+        (is (not (str/includes? prefix "/f16.clj")))))
+    (testing "twenty 512-character paths: one named, the rest counted, prefix near its budget"
+      (let [segment (apply str (repeat 70 "a"))
+            paths (mapv #(str "src/" (str/join "/" (repeat 7 segment)) "/file-" % ".clj") (range 20))
+            prefix (rules/post-edit-prefix ["a.mdc"] paths shell)]
+        (is (= 512 (apply max (map count paths))))
+        (is (str/includes? prefix "/file-0.clj and 19 more, changed by a shell command]"))
+        (is (< (count prefix) 2000))))
+    (testing "a single path longer than the budget is counted, not named"
+      (let [prefix (rules/post-edit-prefix ["a.mdc"] [(apply str (repeat 1200 "p"))] shell)]
+        (is (str/includes? prefix "[rule-fairy matched: glob on 1 paths, changed by a shell command]"))))
+    (testing "hundreds of paths, as after a rebase, keep the prefix near its budget"
+      (let [many (mapv #(str "apps/home/src/scarlet/home/ui/some/deeply/nested/namespace/file_" % "_controller.clj")
+                       (range 300))
+            prefix (rules/post-edit-prefix (mapv #(str "rule-" % ".mdc") (range 14)) many shell)]
+        (is (re-find #" and 2\d\d more, changed by a shell command\]" prefix))
+        (is (< (count prefix) 2000))))))
+
 (deftest prompt-match-reasons-test
   (is (= [] (rules/prompt-match-reasons [])))
   (is (= ["[rule-fairy matched: alwaysApply base.mdc, core.mdc]"]

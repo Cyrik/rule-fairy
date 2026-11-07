@@ -98,21 +98,28 @@
          (> (.lastModified cache)
             (rules/rules-tree-mtime rules-source)))))
 
-(defn build-cache []
-  (rules/rule-globs-index (rules/rule-index rules-source)))
+(defn build-cache
+  "The selection index of every rule: {:globs {rule [glob ...]} :always-on
+  [rule ...]}."
+  []
+  (let [index (rules/rule-index rules-source)]
+    {:globs (rules/rule-globs-index index)
+     :always-on (rules/always-apply-rule-names index)}))
 
 (defn load-or-build-cache
-  "The globs index, from the cache when it is newer than the rules tree and was
-  written for the current rules source."
+  "The selection index, from the cache when it is newer than the rules tree
+  and was written for the current rules source in the current format."
   []
   (let [cached (when (cache-valid?) (edn/read-string (slurp cache-file)))]
-    (if (and (map? cached) (= (:source cached) (cache-source)))
-      (:globs cached)
-      (let [globs (build-cache)]
+    (if (and (map? cached)
+             (= (:source cached) (cache-source))
+             (contains? cached :always-on))
+      (select-keys cached [:globs :always-on])
+      (let [index (build-cache)]
         (ensure-state-dir!)
         (io/make-parents cache-file)
-        (session-state/replace-file! cache-file (pr-str {:source (cache-source) :globs globs}))
-        globs))))
+        (session-state/replace-file! cache-file (pr-str (assoc index :source (cache-source))))
+        index))))
 
 ;;; Paths
 
@@ -133,7 +140,14 @@
 
 (defn rules-for-path [relative-file-path]
   (filter #(rules/rule-file rules-source %)
-          (rules/rules-matching-path (load-or-build-cache) relative-file-path)))
+          (rules/rules-matching-path (:globs (load-or-build-cache)) relative-file-path)))
+
+(defn always-on-rules
+  "The `alwaysApply` rules, which every event delivers when the context
+  lacks them."
+  []
+  (filter #(rules/rule-file rules-source %)
+          (:always-on (load-or-build-cache))))
 
 ;;; Files written through the shell
 
@@ -176,13 +190,30 @@
 (defn rules-for-prompt [prompt]
   (rules/rules-for-prompt rules-source prompt))
 
-(defn prepare-injection!
-  "Renders the rules and, once that succeeded, records them as injected on
-  state. Call under the session lock."
-  [session-id state rule-names current-metrics]
-  (let [contents (render-rules rule-names)]
-    (mark-injected! session-id state rule-names current-metrics)
-    contents))
+(defn fitted-injection!
+  "Renders the longest prefix of rule-names, in match order, whose
+  documentation fits the engine's budget and records those rules as
+  injected on state: {:delivered names :deferred names :context text},
+  the context being the marker lines prefix-fn builds for the delivered
+  rules, opened by the deferred line when rules are left for the next
+  matching event, then the rendered rules. When the first rule alone is
+  over the budget, {:oversized name :context text}, the context being the
+  error lines, and nothing is recorded. A rule that fails to render for
+  another reason throws, so the hook fails. Call under the session lock."
+  [session-id state rule-names current-metrics prefix-fn]
+  (let [{delivered :rule-names :keys [rendered deferred oversized reason]}
+        (rules/fit-delivery rule-names
+                            (fn [delivered _deferred] {:rendered (render-rules delivered)}))]
+    (if oversized
+      {:oversized oversized
+       :context (rules/oversized-rule-lines oversized reason)}
+      (do (mark-injected! session-id state delivered current-metrics)
+          {:delivered delivered
+           :deferred deferred
+           :context (str (when (seq deferred) (str (rules/deferred-line deferred) "\n"))
+                         (prefix-fn delivered)
+                         "\n\n"
+                         rendered)}))))
 
 (defn json-output [m]
   (println (json/generate-string m)))

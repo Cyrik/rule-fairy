@@ -63,36 +63,6 @@
 (defn rules-for-prompt [prompt]
   (rules/rules-for-prompt rules-source prompt))
 
-(def shell-prefix-path-budget
-  "Characters the shell hook's matched line spends on naming changed paths:
-  the leading paths that fit are named and the rest are counted. Rules match
-  by glob, so the names inform the agent without deciding anything, and
-  neither a rebase's hundreds of paths nor a few very long ones may push the
-  prefix past the frame limit."
-  1000)
-
-(defn shell-prefix
-  "The first-frame prefix of a shell-change delivery: the injected markers,
-  the matched line naming the leading changed paths that fit the budget and
-  counting the rest, and the post-edit contract."
-  [rule-names paths]
-  (let [named (loop [named [] remaining paths used 0]
-                (if-let [path (first remaining)]
-                  (let [used (+ used (count path) (if (seq named) 2 0))]
-                    (if (<= used shell-prefix-path-budget)
-                      (recur (conj named path) (rest remaining) used)
-                      named))
-                  named))
-        rest-count (- (count paths) (count named))
-        matched (cond
-                  (empty? named) (str (count paths) " paths")
-                  (pos? rest-count) (str (str/join ", " named) " and " rest-count " more")
-                  :else (str/join ", " named))]
-    (str (str/join "\n" (map #(str "[rule-fairy injected: " % "]") rule-names))
-         "\n[rule-fairy matched: glob on " matched ", changed by a shell command]\n\n"
-         "Apply these rules on the next pass over this change. "
-         "If the completed change conflicts with them, revise it before moving on.")))
-
 (defn ensure-state-dir! []
   (session-state/ensure-dir! state-dir))
 
@@ -208,57 +178,24 @@
                            :max-chars max-frame-chars}))))
       frames)))
 
-(defn- deferred-line [rule-names]
-  (str "[rule-fairy deferred: " (str/join ", " rule-names)
-       " (past what one delivery can carry; delivered with the next matching event)]"))
-
-(defn- oversized-rule-frame [rule-name reason]
-  (str "[rule-fairy error: " rule-name " alone " reason "]\n"
-       "No matched rules were injected or marked as injected."))
-
-(defn- documentation-over-budget?
-  "True for the engine's documentation budget error, which carries the byte
-  counts. Any other rendering error is a broken rule and stays an error."
-  [error]
-  (contains? (ex-data error) :expanded-bytes))
-
 (defn- fitting-delivery
-  "The longest prefix of rule-names, in match order, that fits one delivery:
-  its frames within max-frames-per-delivery of max-frame-chars each and its
-  documentation within the engine's budget, as {:rule-names :frames
-  :deferred}; the first frame's marker lines open with the deferred rest.
-  {:oversized name :reason text} when the first rule alone fits neither.
-  Every shorter attempt renders again, because the documentation blocks
-  merge across the rules delivered together. The deferred line counts
-  against the first frame's limit, which also bounds every piece, so a rule
-  that alone fills every frame is reported oversized while others are
-  deferred; that boundary is far above any real rule."
+  "rules/fit-delivery for the mod's frames: a delivery fits when its frames
+  are within max-frames-per-delivery of max-frame-chars each, the first
+  frame's marker lines opening with the deferred rest. The deferred line
+  counts against the first frame's limit, which also bounds every piece,
+  so a rule that alone fills every frame is reported oversized while others
+  are deferred; that boundary is far above any real rule."
   [rule-names prefix-fn delivery-id]
-  (loop [delivered-count (count rule-names)]
-    (let [delivered (subvec rule-names 0 delivered-count)
-          deferred (subvec rule-names delivered-count)
-          prefix (cond->> (prefix-fn delivered)
-                   (seq deferred) (str (deferred-line deferred) "\n"))
-          {:keys [frames over-budget]} (try
-                                         {:frames (injection-frames delivered prefix delivery-id)}
-                                         (catch clojure.lang.ExceptionInfo error
-                                           (if (documentation-over-budget? error)
-                                             {:over-budget (ex-data error)}
-                                             (throw error))))]
-      (cond
-        (and frames (<= (count frames) max-frames-per-delivery))
-        {:rule-names delivered :frames frames :deferred deferred}
-
-        (= 1 delivered-count)
-        {:oversized (first delivered)
-         :reason (if over-budget
-                   (str "expands to " (:expanded-bytes over-budget)
-                        " bytes of documentation, over the " (:max-bytes over-budget) "-byte budget")
-                   (str "needs " (count frames) " context entries, but one delivery carries "
-                        max-frames-per-delivery))}
-
-        :else
-        (recur (dec delivered-count))))))
+  (rules/fit-delivery
+   rule-names
+   (fn [delivered deferred]
+     (let [prefix (cond->> (prefix-fn delivered)
+                    (seq deferred) (str (rules/deferred-line deferred) "\n"))
+           frames (injection-frames delivered prefix delivery-id)]
+       (if (<= (count frames) max-frames-per-delivery)
+         {:rendered frames}
+         {:reason (str "needs " (count frames) " context entries, but one delivery carries "
+                       max-frames-per-delivery)})))))
 
 (def recent-delivery-ms
   "How long a delivery counts as held by the conversation before the
@@ -318,10 +255,10 @@
           (do (when (seq paths)
                 (shell-delivered! session-id paths))
               {:context []})
-          (let [{delivered :rule-names :keys [frames deferred oversized reason]}
+          (let [{delivered :rule-names frames :rendered :keys [deferred oversized reason]}
                 (fitting-delivery rule-names prefix-fn (delivery-id event-id))]
             (if oversized
-              {:context [(oversized-rule-frame oversized reason)]}
+              {:context [(rules/oversized-rule-lines oversized reason)]}
               (do (record-delivery! session-id delivered now-ms)
                   ;; A delivery that defers rules keeps every path pending:
                   ;; the next shell command matches the same rules, finds
@@ -363,28 +300,35 @@
          (> (.lastModified cache)
             (rules/rules-tree-mtime rules-source)))))
 
-(defn build-cache []
-  (rules/rule-globs-index (rules/rule-index rules-source)))
+(defn build-cache
+  "The selection index of every rule: {:globs {rule [glob ...]} :always-on
+  [rule ...]}."
+  []
+  (let [index (rules/rule-index rules-source)]
+    {:globs (rules/rule-globs-index index)
+     :always-on (rules/always-apply-rule-names index)}))
 
 (defn- read-cache
-  "The cached globs index, or nil when the cache was written for another rules
-  source (a changed rule-fairy.edn) or in an older format."
+  "The cached selection index, or nil when the cache was written for another
+  rules source (a changed rule-fairy.edn) or in an older format."
   []
   (let [cached (edn/read-string (slurp cache-file))]
-    (when (and (map? cached) (= (:source cached) (cache-source)))
-      (:globs cached))))
+    (when (and (map? cached)
+               (= (:source cached) (cache-source))
+               (contains? cached :always-on))
+      (select-keys cached [:globs :always-on]))))
 
 (defn- write-cache! []
-  (let [globs (build-cache)]
+  (let [index (build-cache)]
     (ensure-state-dir!)
     (io/make-parents cache-file)
-    (session-state/replace-file! cache-file (pr-str {:source (cache-source) :globs globs}))
-    globs))
+    (session-state/replace-file! cache-file (pr-str (assoc index :source (cache-source))))
+    index))
 
 (defn load-or-build-cache
-  "The globs index, from the cache when it is younger than the TTL or still
-  newer than the rules tree. Only a passed mtime check refreshes the TTL, so
-  the fast path cannot extend itself indefinitely."
+  "The selection index, from the cache when it is younger than the TTL or
+  still newer than the rules tree. Only a passed mtime check refreshes the
+  TTL, so the fast path cannot extend itself indefinitely."
   []
   (let [cache (io/file cache-file)
         now (System/currentTimeMillis)]
@@ -394,11 +338,18 @@
             (read-cache)
 
             (cache-valid?)
-            (when-let [globs (read-cache)]
+            (when-let [index (read-cache)]
               (.setLastModified cache now)
-              globs)))
+              index)))
         (write-cache!))))
 
 (defn rules-for-path [file-path]
   (filter #(rules/rule-file rules-source %)
-          (rules/rules-matching-path (load-or-build-cache) file-path)))
+          (rules/rules-matching-path (:globs (load-or-build-cache)) file-path)))
+
+(defn always-on-rules
+  "The `alwaysApply` rules, which every event delivers when the context
+  lacks them."
+  []
+  (filter #(rules/rule-file rules-source %)
+          (:always-on (load-or-build-cache))))

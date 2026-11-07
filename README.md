@@ -6,7 +6,7 @@ Rule Fairy is a plugin for Claude Code and Codex. It reads the rules a
 repository already keeps for Cursor (`.cursor/rules/**/*.mdc`, or any
 directories you configure) and injects the relevant ones into the agent's
 context: when a prompt mentions a rule's keywords, when the agent edits a file
-the rule's globs match, or on the first prompt for rules marked `alwaysApply`.
+the rule's globs match, and with the first event for rules marked `alwaysApply`.
 Rules can import sections of your documentation by heading, and injected rules
 come back after the context is compacted. The same matcher powers a review of
 a diff or a plan against the rules that apply to it.
@@ -95,23 +95,25 @@ request also needs the GitHub CLI (`gh`), logged in.
   way. The block names are configurable (see Configuration).
 - **Edit hook** (Claude `tool.call` on Edit, Write, MultiEdit, NotebookEdit
   and MCP edit tools, Codex `PostToolUse`): matches the edited path against
-  every rule's `globs` and injects the matches. On Claude Code the rules
+  every rule's `globs` and injects the matches, with every `alwaysApply`
+  rule the context lacks. On Claude Code the rules
   arrive with the tool's result; on Codex the injection stops the planned
   turn so the model considers the rules before moving on.
 - **Shell hook** (Claude `tool.call` on `Bash`, Codex `PostToolUse` on
   `Bash`): a shell command can write files no tool input names, such as a
   heredoc, `sed -i` or `mv`. After the command the hook asks git which files
   changed since the session's last shell check, matches them against the
-  globs and injects the rules with the post-edit contract: apply them on the
-  next pass, revise the change where it conflicts. The check advances with
+  globs and injects the rules, with every `alwaysApply` rule the context
+  lacks, under the post-edit contract: apply them on the next pass, revise
+  the change where it conflicts. The check advances with
   every shell command and starts at the first prompt. The check reads the
   working tree, so a commit, checkout, rebase or pull that moves HEAD brings
   nothing, and a file written and committed in the same command is not
   seen. A change stays pending until its rules have reached the agent, so a
   rule that fails to build or a delivery cut short is retried by the next
-  command. On Claude Code, the injected context names the changed paths
-  that fit a 1,000-character budget and counts the rest, so a rebase's
-  hundreds of paths stay one line. Outside a git checkout nothing is
+  command. The injected context names the changed paths that fit a
+  1,000-character budget and counts the rest, so a rebase's hundreds of
+  paths stay one line. Outside a git checkout nothing is
   detected. On by default for Claude Code and off for Codex; `:shell-hook`
   in `rule-fairy.edn` switches either (see Configuration).
 - **Dedup**: on Claude Code a rule is delivered when no whole delivery of it
@@ -126,23 +128,25 @@ request also needs the GitHub CLI (`gh`), logged in.
   compaction or after 2 MiB of transcript growth as a fallback for silent
   context cleanup. State lives under `.rule-fairy/<harness>/` in the project
   and ignores itself in git.
-- **Bounded delivery**: on Claude Code one delivery is at most two context
-  entries of 100,000 characters each, which the model reads whole; a
-  settings hook's output is cut at 10,000 characters
+- **Bounded delivery**: a matched set is delivered in match order as far as
+  one delivery carries it. The delivery opens by naming the rest, which
+  comes with the next event that matches it, and a single rule too large
+  for one delivery is reported and never recorded. One delivery carries
+  documentation within the 64 KiB budget on both harnesses, and on Claude
+  Code at most two context entries of 100,000 characters each, which the
+  model reads whole; a settings hook's output is cut at 10,000 characters
   (anthropics/claude-code#94358), which is why the Claude Code side is a mod.
-  A matched set that needs more entries than that, or more documentation
-  than the 64 KiB budget, is delivered in match order as far as it fits; the
-  first entry names the rest, which comes with the next event that matches
-  it. A single rule too large for either is reported and never recorded.
   Codex caps `additionalContext` at 2,500 tokens by default; the
-  registration sets `additionalContextLimit` to 0.
+  registration sets `additionalContextLimit` to 0, and the post-edit hook's
+  `continue: false` path delivered 58 KB whole on Codex CLI 0.163.
 - **Failures are visible**: on Claude Code a delivery that fails, its
   process exiting non-zero or the hook itself throwing or timing out,
   attaches one error entry naming the failure and logs a line to the
   transcript, so the model and the person both see it, and the prompt or
   tool goes on as if unhooked. Once a prompt has entered the session no
   context can attach any more, so a failure after that point is logged
-  only.
+  only. On Codex a rule that fails to build fails the hook, which Codex
+  reports, and a shell change stays pending for the next command.
 - **Review skill** (`rule-fairy:review`, both harnesses): fetches a diff (a
   pull request through `gh`, uncommitted work, or a branch against its base),
   builds a bundle of the instruction files, rules and documentation that apply
@@ -390,10 +394,11 @@ tests against them.
 - An invalid glob in a rule fails the hook with the glob named, instead of
   silently matching nothing. Rule files are user input; the failure is loud on
   purpose.
-- `alwaysApply: true` rules are selected by the prompt hooks on every prompt
-  and delivered through the normal session dedup, so they arrive with the
-  first prompt and return after compaction. Consuming repositories should not
-  duplicate that content in `CLAUDE.md` or `AGENTS.md`.
+- `alwaysApply: true` rules are selected by every hook, prompt, edit and
+  shell, and delivered through the normal session dedup, so they arrive with
+  a session's first event and return with the next event of any kind after
+  a compaction. Consuming repositories should not duplicate that content in
+  `CLAUDE.md` or `AGENTS.md`.
 - On Codex, transcript metrics are read incrementally. The session state
   keeps a scan cursor and each event counts only the complete lines appended
   since, so the per-prompt cost of the reinjection check does not grow with

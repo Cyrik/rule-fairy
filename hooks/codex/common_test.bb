@@ -61,8 +61,9 @@
     (fn [root]
       (with-redefs [rule-common/rules-source (rules/project-rules-source root)
                     rule-common/load-or-build-cache
-                    (constantly {"ui.mdc" ["apps/**/ui/**/*.clj"]
-                                 "testing.mdc" ["**/test/**/*.clj"]})]
+                    (constantly {:globs {"ui.mdc" ["apps/**/ui/**/*.clj"]
+                                         "testing.mdc" ["**/test/**/*.clj"]}
+                                 :always-on []})]
         (is (= #{"ui.mdc"}
                (set (rule-common/rules-for-path
                      "apps/example/src/example/ui/screen.clj"))))
@@ -78,8 +79,9 @@
      "---\nglobs: apps/nested/**\nalwaysApply: false\n---\n# Nested UI"}
     (fn [root]
       (with-redefs [rule-common/rules-source (rules/project-rules-source root)]
-        (is (= {"ui.mdc" ["apps/top/**"]
-                "tasks/ui.mdc" ["apps/nested/**"]}
+        (is (= {:globs {"ui.mdc" ["apps/top/**"]
+                        "tasks/ui.mdc" ["apps/nested/**"]}
+                :always-on []}
                (rule-common/build-cache)))))))
 
 (deftest glob-cache-invalidates-on-nested-rename-test
@@ -528,33 +530,85 @@
       (rule-common/save-session-state! "session" {:sizes {}})
       (is (= "*\n" (slurp (io/file rule-common/state-dir ".gitignore")))))))
 
-(deftest prepare-injection-test
-  (testing "successful rendering is persisted after rendering"
-    (let [events (atom [])]
-      (with-redefs [rule-common/render-rules
-                    (fn [_]
-                      (swap! events conj :render)
-                      "rendered")
-                    rule-common/mark-injected!
-                    (fn [& _]
-                      (swap! events conj :mark))]
-        (is (= "rendered"
-               (rule-common/prepare-injection! "session" {} [rule-name] nil)))
-        (is (= [:render :mark] @events)))))
+(deftest fitted-injection-test
+  (let [prefix (fn [delivered] (str "prefix for " (str/join ", " delivered)))]
+    (testing "successful rendering is recorded after rendering, the context opening with the prefix"
+      (let [events (atom [])]
+        (with-redefs [rule-common/render-rules
+                      (fn [_]
+                        (swap! events conj :render)
+                        "rendered")
+                      rule-common/mark-injected!
+                      (fn [_ _ names _]
+                        (swap! events conj [:mark (vec names)]))]
+          (is (= {:delivered [rule-name] :deferred [] :context (str "prefix for " rule-name "\n\nrendered")}
+                 (rule-common/fitted-injection! "session" {} [rule-name] nil prefix)))
+          (is (= [:render [:mark [rule-name]]] @events)))))
+    (testing "a rule that fails to render for any reason but the budget is not recorded and the failure surfaces"
+      (let [marked? (atom false)]
+        (with-redefs [rule-common/render-rules
+                      (fn [_]
+                        (throw (ex-info "render failed" {})))
+                      rule-common/mark-injected!
+                      (fn [& _]
+                        (reset! marked? true))]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                #"render failed"
+                                (rule-common/fitted-injection! "session" {} [rule-name] nil prefix)))
+          (is (false? @marked?)))))
+    (testing "a set over the documentation budget is delivered as far as it fits, the rest deferred, only the delivered recorded"
+      (let [marked (atom nil)
+            over-budget (ex-info "Expanded rule documentation exceeds budget"
+                                 {:expanded-bytes 70000 :max-bytes 65536})]
+        (with-redefs [rule-common/render-rules
+                      (fn [names]
+                        (if (> (count names) 1) (throw over-budget) (str "rendered " (first names))))
+                      rule-common/mark-injected!
+                      (fn [_ _ names _] (reset! marked (vec names)))]
+          (is (= {:delivered ["a.mdc"] :deferred ["b.mdc" "c.mdc"]
+                  :context (str "[rule-fairy deferred: b.mdc, c.mdc (past what one delivery can carry; delivered with the next matching event)]\n"
+                                "prefix for a.mdc\n\nrendered a.mdc")}
+                 (rule-common/fitted-injection! "session" {} ["a.mdc" "b.mdc" "c.mdc"] nil prefix)))
+          (is (= ["a.mdc"] @marked)))))
+    (testing "a single rule over the budget is reported as the context and nothing is recorded"
+      (let [marked? (atom false)]
+        (with-redefs [rule-common/render-rules
+                      (fn [_] (throw (ex-info "Expanded rule documentation exceeds budget"
+                                              {:expanded-bytes 70000 :max-bytes 65536})))
+                      rule-common/mark-injected!
+                      (fn [& _] (reset! marked? true))]
+          (is (= {:oversized "big.mdc"
+                  :context (str "[rule-fairy error: big.mdc alone expands to 70000 bytes of documentation, over the 65536-byte budget]\n"
+                                "No matched rules were injected or marked as injected.")}
+                 (rule-common/fitted-injection! "session" {} ["big.mdc"] nil prefix)))
+          (is (false? @marked?)))))))
 
-  (testing "failed rendering is not persisted"
-    (let [marked? (atom false)]
-      (with-redefs [rule-common/render-rules
-                    (fn [_]
-                      (throw (ex-info "render failed" {})))
-                    rule-common/mark-injected!
-                    (fn [& _]
-                      (reset! marked? true))]
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                              #"render failed"
-                              (rule-common/prepare-injection!
-                               "session" {} [rule-name] nil)))
-        (is (false? @marked?))))))
+(deftest delivery-fits-the-documentation-budget-test
+  (let [half (apply str (repeat 40000 "x"))]
+    (with-temp-project
+      {".cursor/rules/a.mdc" "---\npromptAnyOf: widget\n---\n# A\n\n@doc/a.md\n"
+       ".cursor/rules/b.mdc" "---\npromptAnyOf: widget\n---\n# B\n\n@doc/b.md\n"
+       ".cursor/rules/big.mdc" "---\npromptAnyOf: gadget\n---\n# Big\n\n@doc/big.md\n"
+       "doc/a.md" (str "# A doc\n\n" half)
+       "doc/b.md" (str "# B doc\n\n" half)
+       "doc/big.md" (str "# Big doc\n\n" half half)}
+      (fn [root]
+        (testing "two rules whose documentation together passes the budget: the first is delivered, the second deferred and named first"
+          (let [context (run-prompt-hook root "session-fit" "add a widget")]
+            (is (str/starts-with? context "[rule-fairy deferred: b.mdc (past what one delivery can carry; delivered with the next matching event)]\n[rule-fairy injected: a.mdc]\n[rule-fairy matched: keyword \"widget\"]\n\n"))
+            (is (str/includes? context "# A doc"))
+            (is (not (str/includes? context "# B doc")))))
+        (testing "the next matching prompt delivers the deferred rule"
+          (let [context (run-prompt-hook root "session-fit" "another widget")]
+            (is (str/starts-with? context "[rule-fairy injected: b.mdc]\n"))
+            (is (str/includes? context "# B doc"))))
+        (testing "a single rule over the budget is reported, and the next prompt reports it again"
+          (let [context (run-prompt-hook root "session-fit" "a gadget")]
+            (is (str/starts-with? context "[rule-fairy error: big.mdc alone expands to "))
+            (is (str/ends-with? context "No matched rules were injected or marked as injected."))
+            (is (not (str/includes? context "# Big doc"))))
+          (is (str/starts-with? (run-prompt-hook root "session-fit" "the gadget again")
+                                "[rule-fairy error: big.mdc alone")))))))
 
 (deftest heading-import-test
   (with-temp-project
@@ -671,6 +725,43 @@
           (is (str/includes? rendered "## Required context: `doc/ui.md#components`"))
           (is (str/includes? rendered "reuse components"))
           (is (not (str/includes? rendered "not imported"))))))))
+
+(deftest always-on-on-edit-test
+  (with-temp-project
+    {".cursor/rules/base.mdc" "---\nalwaysApply: true\n---\n# Base rule\n"
+     ".cursor/rules/widget.mdc" "---\nglobs: src/**\nalwaysApply: false\n---\n# Widget rule\n"
+     "src/a.clj" ""
+     "README.md" ""}
+    (fn [root]
+      (testing "an edit in a session without the always-on rule delivers it with the glob rule"
+        (let [context (run-post-tool-hook root "session-edit" "src/a.clj")]
+          (is (str/includes? context "[rule-fairy injected: widget.mdc]\n[rule-fairy injected: base.mdc]\n[rule-fairy matched: glob on src/a.clj]\n[rule-fairy matched: alwaysApply base.mdc]\n\nApply"))
+          (is (str/includes? context "# Base rule"))))
+      (testing "a session whose prompt delivered the always-on rule gets the glob rule alone"
+        (is (str/includes? (run-prompt-hook root "session-held" "hello") "[rule-fairy injected: base.mdc]"))
+        (let [context (run-post-tool-hook root "session-held" "src/a.clj")]
+          (is (str/includes? context "[rule-fairy injected: widget.mdc]\n[rule-fairy matched: glob on src/a.clj]\n\nApply"))
+          (is (not (str/includes? context "base.mdc")))))
+      (testing "an edit outside every glob still brings the always-on rule, without a glob line"
+        (let [context (run-post-tool-hook root "session-plain" "README.md")]
+          (is (str/includes? context "[rule-fairy injected: base.mdc]\n[rule-fairy matched: alwaysApply base.mdc]\n\nApply"))
+          (is (not (str/includes? context "glob on"))))))))
+
+(deftest post-edit-prefix-budget-test
+  (let [paths (mapv #(str "src/" (apply str (repeat 48 "x")) "/f" (format "%02d" %) ".clj") (range 30))]
+    (with-temp-project
+      (into {".cursor/rules/widget.mdc" "---\nglobs: src/**\nalwaysApply: false\n---\n# Widget rule\n"}
+            (map (fn [path] [path ""]) paths))
+      (fn [root]
+        (let [patch (str/join "\n" (map #(str "*** Update File: " %) paths))
+              context (run-registered-hook :PostToolUse root {:session_id "session-budget"
+                                                              :tool_input {:patch patch}})]
+          (testing "a patch touching thirty long paths names the ones that fit the budget and counts the rest"
+            (is (str/includes? context "[rule-fairy injected: widget.mdc]\n[rule-fairy matched: glob on src/"))
+            (is (str/includes? context "/f15.clj and 14 more]"))
+            (is (not (str/includes? context "/f16.clj"))))
+          (testing "the contract sentence is the shared one"
+            (is (str/includes? context "]\n\nApply these rules on the next pass over this change. If the completed change conflicts with them, revise it before moving on.\n\n# widget.mdc"))))))))
 
 (deftest ignored-prompt-block-test
   (with-temp-project

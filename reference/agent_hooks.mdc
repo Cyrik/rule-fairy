@@ -39,7 +39,7 @@ Claude Code runs for them, and Codex follows the shared `skills/review/reference
 | Hook | Event | Script | Purpose |
 |------|-------|--------|---------|
 | `hooks/codex/prompt.bb` | `UserPromptSubmit` | Always-on rules plus keyword match on prompt text | Inject rules when the user mentions relevant topics |
-| `hooks/codex/post_edit.bb` | `PostToolUse` (edits) | Glob match on edited file path | Inject rules after an edit so the next pass can revise if needed |
+| `hooks/codex/post_edit.bb` | `PostToolUse` (edits) | Glob match on edited file path, plus always-on rules the context lacks | Inject rules after an edit so the next pass can revise if needed |
 
 Both entries set `additionalContextLimit: 0`; see Codex bounded delivery. Codex runs a hook in the session's working
 directory and exports no project directory, so `hooks/codex/common.bb` takes the project root from
@@ -55,8 +55,8 @@ review.
 | Hook in `register.ts` | Fires when | Purpose |
 |------|-------|---------|
 | `prompt.submit` | a prompt is submitted | Always-on rules plus keyword match on the prompt text, attached after the prompt. A prompt another agent or process composed (`e.origin.kind` is task-notification, peer, peer-send-message, projects-relay, coordinator, observer, observer-activity or plugin) selects nothing: keyword rules match what the person asked |
-| `tool.call` on Edit, Write, MultiEdit, NotebookEdit and MCP tools named `edit`, `write` or `patch` | a tool call ran | Glob match on the edited path, attached with the tool's result; nothing on a denied call. Inside a subagent (`e.agentId`) the conversation read and the state key are the subagent's own |
-| `tool.call` on Bash | a shell command ran | The shell check (see Edits made through the shell), attached with the command's result |
+| `tool.call` on Edit, Write, MultiEdit, NotebookEdit and MCP tools named `edit`, `write` or `patch` | a tool call ran | Glob match on the edited path, plus always-on rules the context lacks, attached with the tool's result; nothing on a denied call. Inside a subagent (`e.agentId`) the conversation read and the state key are the subagent's own |
+| `tool.call` on Bash | a shell command ran | The shell check (see Edits made through the shell), plus always-on rules the context lacks, attached with the command's result |
 | `agent.spawn` | a subagent is about to start | Always-on rules plus keyword match on the task, appended to the task inside the reminder wrapper hook context uses, since a spawn has no context channel. A fork is read against the conversation it inherits; any other subagent starts empty. The record is keyed by the spawn's tool call (`spawn_id`) |
 
 Each hook runs `hooks/claude/mod.bb` once through `hooks/run`, with `{"kind": "prompt" | "edit" | "shell", "input":
@@ -112,8 +112,8 @@ handing the model a head and a file path past either. A settings hook's output i
    headings or paragraphs. Fenced code blocks stay intact; one that cannot fit fails instead of producing invalid Markdown.
 2. The parts pack into frames under the limit. Only the first frame carries the marker lines and the contract; later frames
    use that space for rule content.
-3. `fitting-delivery` tries the set in match order and shortens it until the frames fit two entries and the documentation
-   fits the engine's 64 KiB budget. The first frame then opens with `[rule-fairy deferred: ...]` naming the rest, which
+3. `fitting-delivery`, the engine's `rules/fit-delivery` with the frame check, tries the set in match order and shortens
+   it until the frames fit two entries and the documentation fits the engine's 64 KiB budget. The first frame then opens with `[rule-fairy deferred: ...]` naming the rest, which
    comes with the next event that matches it. A single rule that fits neither is reported as the one entry
    (`[rule-fairy error: <rule> alone ...]`) and nothing is recorded.
 4. Every frame opens with `[rule-fairy shard i/n <delivery>]`, the delivery id being the leading twelve hex digits of the
@@ -129,8 +129,15 @@ Unlike a Claude Code settings hook, the Codex cap is configurable per hook. Ever
 Codex adapter therefore delivers one unsharded payload and relies on the engine's 64 KiB documentation budget as the only
 size guard. Do not remove the key when editing the registration; the failure is silent.
 
+That budget is fitted the way Claude Code fits its frames: `rule-common/fitted-injection!` runs `rules/fit-delivery` over
+the matched set, delivers the longest prefix whose documentation fits, opens the context with `[rule-fairy deferred: ...]`
+naming the rest, which comes with the next matching event, and records only the delivered rules. A single rule over the
+budget is delivered as `[rule-fairy error: <rule> alone ...]` with nothing recorded, so it is reported again until the rule
+is fixed. After a shell command the changed paths stay pending while a delivery defers or reports a rule.
+
 Codex states that the setting applies only to `additionalContext` and that tool feedback and continuation prompts keep the
-default limit. Whether the `continue: false` path used by `hooks/codex/post_edit.bb` counts as feedback is not documented.
+default limit. Whether the `continue: false` path used by `hooks/codex/post_edit.bb` counts as feedback is not documented;
+a live check on Codex CLI 0.163 delivered 58,528 characters whole through it.
 
 ### Required documentation
 Both paths render their payload through `rule-fairy.rules`:
@@ -143,10 +150,10 @@ Both paths render their payload through `rule-fairy.rules`:
 5. Remove non-nested `<!-- agent-context: omit -->` blocks
 6. Append the selected canonical documentation to the rule payload
 
-The expanded documentation has a 64 KiB safety budget per hook payload. Missing files, missing headings, invalid omission
-markers, and oversized payloads fail instead of silently dropping required context. On Claude Code a matched set over the
-budget is delivered as far as it fits and the rest deferred to the next matching event, as for a set too large for two
-entries; a single rule over the budget still fails.
+The expanded documentation has a 64 KiB safety budget per hook payload. Missing files, missing headings and invalid
+omission markers fail instead of silently dropping required context. On both harnesses a matched set over the budget is
+delivered as far as it fits and the rest deferred to the next matching event, on Claude Code also a set too large for two
+entries; a single rule over the budget is reported as the delivery and never recorded.
 
 ## Dedup / Reinjection
 

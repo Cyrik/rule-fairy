@@ -9,8 +9,10 @@
 ;; the mod attaches after the prompt or the tool result, or appends to a
 ;; subagent's task, none when nothing is due. A prompt and a subagent's task
 ;; at spawn select by keyword and alwaysApply, an edit by the edited path's
-;; globs, a shell command by the globs of the paths it changed; the delivery
-;; is rule-common/deliver!.
+;; globs, a shell command by the globs of the paths it changed, the last two
+;; with every alwaysApply rule as well, so after a compaction the always-on
+;; rules return with the next event of any kind; the delivery is
+;; rule-common/deliver!.
 
 (require '[rule-fairy.rules :as rules]
          '[cheshire.core :as json]
@@ -36,26 +38,37 @@
 
 (defn- edit-selection [rel-path]
   (fn []
-    {:matching-rules (doall (rule-common/rules-for-path rel-path))
-     :prefix-fn (fn [rule-names]
-                  (str (injected-lines rule-names)
-                       "\n[rule-fairy matched: glob on " rel-path "]"))}))
+    (let [glob-rules (vec (rule-common/rules-for-path rel-path))
+          glob? (set glob-rules)
+          always-on (vec (rule-common/always-on-rules))
+          always-on? (set always-on)]
+      {:matching-rules (distinct (concat glob-rules always-on))
+       :prefix-fn (fn [rule-names]
+                    (str/join "\n"
+                              (remove nil?
+                                      [(injected-lines rule-names)
+                                       (when (some glob? rule-names)
+                                         (str "[rule-fairy matched: glob on " rel-path "]"))
+                                       (rules/always-on-reason (filter always-on? rule-names))])))})))
 
 (defn- shell-selection [session-id]
   (fn []
     (let [paths (rule-common/shell-changes! session-id)
-          path->rules (into {}
-                            (for [path paths
-                                  :let [rules (doall (rule-common/rules-for-path path))]
-                                  :when (seq rules)]
-                              [path rules]))]
-      {:matching-rules (distinct (mapcat val path->rules))
+          paths-with-rules (vec (for [path paths
+                                      :let [rules (doall (rule-common/rules-for-path path))]
+                                      :when (seq rules)]
+                                  [path rules]))
+          always-on (vec (rule-common/always-on-rules))
+          always-on? (set always-on)]
+      {:matching-rules (distinct (concat (mapcat second paths-with-rules) always-on))
        :paths paths
        :prefix-fn (fn [rule-names]
                     (let [injected (set rule-names)
                           paths (keep (fn [[path rules]] (when (some injected rules) path))
-                                      path->rules)]
-                      (rule-common/shell-prefix rule-names paths)))})))
+                                      paths-with-rules)]
+                      (rules/post-edit-prefix rule-names paths
+                                              {:shell? true
+                                               :always-on (filter always-on? rule-names)})))})))
 
 (defn- selection
   "The event's selection, or nil when it delivers nothing: a prompt without

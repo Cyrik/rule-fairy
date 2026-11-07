@@ -371,6 +371,27 @@
                                    {:tool_name "mcp__filesystem__write_file"})
                              "[rule-fairy matched: glob on src/b.clj]")))))))
 
+(deftest always-on-on-edit-test
+  (with-temp-project
+    {".cursor/rules/base.mdc" "---\nalwaysApply: true\n---\n# Base rule\n"
+     ".cursor/rules/widget.mdc" "---\nglobs: src/**\nalwaysApply: false\n---\n# Widget rule\n"
+     "src/a.clj" ""}
+    (fn [root]
+      (let [file (str (io/file root "src/a.clj"))]
+        (testing "an edit in a conversation without the always-on rule delivers it with the glob rule"
+          (let [context (run-edit-hook root "session-edit" {:file_path file} {})]
+            (is (str/includes? context "[rule-fairy injected: widget.mdc]\n[rule-fairy injected: base.mdc]\n[rule-fairy matched: glob on src/a.clj]\n[rule-fairy matched: alwaysApply base.mdc]"))
+            (is (str/includes? context "# Base rule"))))
+        (testing "a conversation that holds the always-on rule gets the glob rule alone"
+          (let [context (run-edit-hook root "session-held" {:file_path file}
+                                       {:in_context_frames (in-context "base.mdc")})]
+            (is (str/includes? context "[rule-fairy injected: widget.mdc]\n[rule-fairy matched: glob on src/a.clj]"))
+            (is (not (str/includes? context "base.mdc")))))
+        (testing "an edit outside every glob still brings the always-on rule, without a glob line"
+          (let [context (run-edit-hook root "session-plain" {:file_path (str (io/file root "README.md"))} {})]
+            (is (str/includes? context "[rule-fairy injected: base.mdc]\n[rule-fairy matched: alwaysApply base.mdc]"))
+            (is (not (str/includes? context "glob on")))))))))
+
 (deftest spawn-delivery-test
   (with-temp-project
     {".cursor/rules/base.mdc" "---\nalwaysApply: true\n---\n# Base rule\n"
@@ -602,36 +623,6 @@
 
 (defn shell-pending-state []
   (:shell-pending (rule-common/load-session-state "session")))
-
-(deftest shell-prefix-names-paths-within-a-character-budget-test
-  (testing "paths that fit the budget are named in full"
-    (let [paths (mapv #(str "src/file-" % ".clj") (range 25))
-          prefix (rule-common/shell-prefix ["a.mdc" "b.mdc"] paths)]
-      (is (str/starts-with? prefix "[rule-fairy injected: a.mdc]\n[rule-fairy injected: b.mdc]\n[rule-fairy matched: glob on src/file-0.clj, "))
-      (is (str/includes? prefix "src/file-24.clj, changed by a shell command]"))
-      (is (not (str/includes? prefix " more")))))
-  (testing "the leading paths that fit are named, the rest counted: 60-character paths, 16 fit in 1,000"
-    (let [paths (mapv #(str "src/" (apply str (repeat 48 "x")) "/f" (format "%02d" %) ".clj") (range 30))
-          prefix (rule-common/shell-prefix ["a.mdc"] paths)]
-      (is (every? #(= 60 (count %)) paths))
-      (is (str/includes? prefix "/f15.clj and 14 more, changed by a shell command]"))
-      (is (not (str/includes? prefix "/f16.clj")))))
-  (testing "twenty 512-character paths: one named, the rest counted, prefix near its budget"
-    (let [segment (apply str (repeat 70 "a"))
-          paths (mapv #(str "src/" (str/join "/" (repeat 7 segment)) "/file-" % ".clj") (range 20))
-          prefix (rule-common/shell-prefix ["a.mdc"] paths)]
-      (is (= 512 (apply max (map count paths))))
-      (is (str/includes? prefix "/file-0.clj and 19 more, changed by a shell command]"))
-      (is (< (count prefix) 2000))))
-  (testing "a single path longer than the budget is counted, not named"
-    (let [prefix (rule-common/shell-prefix ["a.mdc"] [(apply str (repeat 1200 "p"))])]
-      (is (str/includes? prefix "[rule-fairy matched: glob on 1 paths, changed by a shell command]"))))
-  (testing "hundreds of paths, as after a rebase, keep the prefix near its budget"
-    (let [many (mapv #(str "apps/home/src/scarlet/home/ui/some/deeply/nested/namespace/file_" % "_controller.clj")
-                     (range 300))
-          prefix (rule-common/shell-prefix (mapv #(str "rule-" % ".mdc") (range 14)) many)]
-      (is (re-find #" and 2\d\d more, changed by a shell command\]" prefix))
-      (is (< (count prefix) 2000)))))
 
 (deftest shell-paths-clear-with-their-delivery-test
   (with-temp-state
