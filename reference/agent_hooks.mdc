@@ -188,9 +188,10 @@ race condition: session A reads, session B reads, A writes, B writes, and A's de
 Claude Code fires the tool hooks inside subagents too, with the agent id on the event. A subagent's context starts
 without the main thread's deliveries (a fork inherits them), so the mod reads the subagent's own conversation
 (`$.session.messages({ agentId })`) and `mod.bb` keys the state file and lock by session id and agent id
-(`rule-common/state-id`); a delivery in one agent is never recorded against another. Codex marks nothing on a
-subagent's tool events and gives them the parent's session id, so there a subagent and its parent share one history;
-the README lists it as a gap.
+(`rule-common/state-id`); a delivery in one agent is never recorded against another. Codex marks a subagent's tool
+events with `agent_id` too, under the parent's session id (CLI 0.163; the hooks doc tables omit the field), and names
+the subagent's own rollout in `transcript_path`, so `hooks/codex` keys its state the same way and the transcript
+metrics follow the subagent's rollout.
 
 ### Hooks run in the session `cwd`, which follows the Bash tool's shell
 Claude Code's session working directory moves when the agent's Bash tool runs `cd`; the mod runs `mod.bb` there and
@@ -266,8 +267,9 @@ from before the other's result was recorded. `deliver!` reads the conversation's
 the pending shell paths, decides and records inside one `with-session-lock` call; the one-minute record is what makes the
 second delivery find the first. Do not move the decision or the record outside that call.
 
-Codex launches every hook matching an event concurrently, and a subagent's hooks carry the parent's session id, so
-its hooks contend for one state file too. Each Codex hook therefore reads the state, decides what to inject and
+Codex launches every hook matching an event concurrently, so the hooks of one agent contend for one state file (a
+subagent's events carry the parent's session id and the agent id, which together key its file). Each Codex hook
+therefore reads the state, decides what to inject and
 records it inside one `with-session-lock` call, the same per-session file lock (`rule-fairy.session-state/with-lock`)
 the Claude adapter uses, and prints its output after the lock is released. A helper that loads or saves session state
 outside that call reintroduces the lost update.

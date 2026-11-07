@@ -65,11 +65,21 @@
 (defn save-session-state! [session-id state]
   (session-state/save-state! state-dir session-id state))
 
+(defn state-id
+  "The key of the hook input's session state and lock: the session id in
+  the main thread; inside a subagent, whose tool events Codex marks with
+  agent_id under the parent's session id (CLI 0.163; the hooks doc tables
+  omit the field), the session id and the agent id joined by a dot, so the
+  subagent's deliveries and transcript metrics are recorded apart from
+  the parent's and from its sibling agents'."
+  [{:keys [session_id agent_id]}]
+  (if agent_id (str session_id "." agent_id) session_id))
+
 (defn with-session-lock
-  "Calls f holding the session's lock and returns its value. Codex launches
-  every hook matching an event at once, and a subagent's hooks carry the
-  parent's session id, so a hook reads the state, decides and saves inside
-  one call; the helpers below expect to run under it."
+  "Calls f holding the lock of the state key (state-id) and returns its
+  value. Codex launches every hook matching an event at once, so a hook
+  reads the state, decides and saves inside one call; the helpers below
+  expect to run under it."
   [session-id f]
   @plugin-root-recorded
   (session-state/with-lock state-dir session-id f))

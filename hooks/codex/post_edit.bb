@@ -9,7 +9,8 @@
 ;; post-edit contract: apply them on the next pass and revise the finished
 ;; change where it conflicts. The shell path is off
 ;; unless `:shell-hook {:codex true}` is set in rule-fairy.edn; a Bash event
-;; then ends here.
+;; then ends here. A subagent's events, marked with agent_id, keep their
+;; own state (rule-common/state-id).
 
 (require '[clojure.java.io :as io])
 
@@ -74,21 +75,22 @@
          :settled? (and (empty? deferred) (nil? oversized))}))))
 
 (let [{:keys [session_id cwd tool_name tool_input] :as input} (rule-common/read-json-stdin)
-      shell? (= "Bash" tool_name)]
+      shell? (= "Bash" tool_name)
+      state-id (rule-common/state-id input)]
   (when (and session_id cwd tool_input (or (not shell?) (rule-common/shell-hook-enabled?)))
     (when-let [output
                (rule-common/with-session-lock
-                session_id
+                state-id
                 (fn []
                   (let [relative-paths (if shell?
-                                         (rule-common/shell-changes! session_id)
+                                         (rule-common/shell-changes! state-id)
                                          (map #(rule-common/relative-path cwd %) (paths-from-input tool_input)))
-                        {:keys [output settled?]} (edit-output session_id input shell? relative-paths)]
+                        {:keys [output settled?]} (edit-output state-id input shell? relative-paths)]
                     ;; Reached only once the rules were built, so a failure
                     ;; above keeps the paths pending for the next shell
                     ;; command, as a delivery that defers or reports a rule
                     ;; does: the next command delivers the rest.
                     (when (and shell? settled?)
-                      (rule-common/shell-delivered! session_id relative-paths))
+                      (rule-common/shell-delivered! state-id relative-paths))
                     output)))]
       (rule-common/json-output output))))

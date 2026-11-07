@@ -41,12 +41,13 @@
 
 (let [{:keys [prompt session_id] :as input} (rule-common/read-json-stdin)]
   (when (and prompt session_id)
-    (let [matches (rule-common/rules-for-prompt prompt)]
+    (let [matches (rule-common/rules-for-prompt prompt)
+          state-id (rule-common/state-id input)]
       (when-let [output
                  (rule-common/with-session-lock
-                  session_id
+                  state-id
                   (fn []
                     (when (rule-common/shell-hook-enabled?)
-                      (rule-common/ensure-shell-marker! session_id))
-                    (prompt-output session_id input matches)))]
+                      (rule-common/ensure-shell-marker! state-id))
+                    (prompt-output state-id input matches)))]
         (rule-common/json-output output)))))

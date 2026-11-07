@@ -408,11 +408,14 @@ tests against them.
 - Each harness keeps one dedup map per session shared by all of its hooks. A
   rule delivered after an edit is not delivered again by the next prompt, and
   the reverse. Codex previously kept separate prompt and post-edit buckets.
-- On Claude Code each agent of a session has its own deliveries. A
-  subagent's tool calls are matched against the subagent's own conversation
-  and recorded under its own state file, `<session>.<agent>.edn`, so a fork
-  starts with what it inherited, a fresh subagent starts empty, and neither
-  touches the main thread's history or a sibling's. A subagent's task is
+- Each agent of a session has its own deliveries, on both harnesses. On
+  Claude Code a subagent's tool calls are matched against the subagent's own
+  conversation and recorded under its own state file, `<session>.<agent>.edn`,
+  so a fork starts with what it inherited, a fresh subagent starts empty,
+  and neither touches the main thread's history or a sibling's. On Codex,
+  whose tool events carry the agent id since CLI 0.163, the same key holds
+  a subagent's delivery record and its transcript metrics, read from the
+  subagent's own rollout, which its events name. A subagent's task is
   matched at spawn the way a prompt is, always-on and keyword rules, and what
   it selects is appended to the task inside the reminder wrapper hook
   context uses, since a spawn has no context channel; a fork is matched
@@ -433,7 +436,7 @@ tests against them.
 - Every hook updates its session's state under a per-session file lock.
   Claude Code runs tool calls, and so their hooks, side by side; Codex
   launches the hooks matching an event concurrently and runs a subagent's
-  hooks under the parent's session id.
+  hooks under the parent's session id with the agent id on its tool events.
 - An edited path is matched the way the project's globs are written: relative
   to the checkout that holds the file, less the project's own position in its
   checkout. A session started in a subdirectory of a repository keeps its
@@ -497,11 +500,6 @@ tests against them.
 
 ## Known gaps
 
-- **Codex subagents share the parent's history.** Codex runs a subagent's
-  hooks under the parent's session id and marks nothing on its tool events,
-  so a subagent's deliveries are recorded against the parent and the
-  parent's against it: a rule one of them holds is withheld from the other.
-  On Claude Code each agent has its own history (see Design notes).
 - **Shell edits outside git.** The shell hook finds what a command wrote
   through `git status`, so in a directory that is not a checkout files
   written by shell commands get no rules. A walk comparing file times was

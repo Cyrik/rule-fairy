@@ -726,6 +726,28 @@
           (is (str/includes? rendered "reuse components"))
           (is (not (str/includes? rendered "not imported"))))))))
 
+(deftest subagent-state-test
+  (with-temp-project
+    {".cursor/rules/widget.mdc" "---\nglobs: src/**\nalwaysApply: false\n---\n# Widget rule\n"
+     "src/a.clj" ""}
+    (fn [root]
+      (let [edit (fn [session-id extra-input]
+                   (run-registered-hook :PostToolUse root
+                                        (merge {:session_id session-id
+                                                :tool_input {:file_path "src/a.clj"}}
+                                               extra-input)))]
+        (testing "inside a subagent the hook delivers and records under the agent's own state"
+          (is (str/includes? (edit "session-sub" {:agent_id "agent-1" :agent_type "default"})
+                             "# Widget rule"))
+          (is (.exists (io/file root ".rule-fairy/codex/session-sub.agent-1.edn")))
+          (is (not (.exists (io/file root ".rule-fairy/codex/session-sub.edn")))))
+        (testing "the parent's history is its own, so the parent gets the rule too"
+          (is (str/includes? (edit "session-sub" {}) "# Widget rule")))
+        (testing "a sibling subagent has a history of its own"
+          (is (str/includes? (edit "session-sub" {:agent_id "agent-2"}) "# Widget rule")))
+        (testing "the first subagent's record withholds the rule from its next edit"
+          (is (nil? (edit "session-sub" {:agent_id "agent-1"}))))))))
+
 (deftest always-on-on-edit-test
   (with-temp-project
     {".cursor/rules/base.mdc" "---\nalwaysApply: true\n---\n# Base rule\n"
