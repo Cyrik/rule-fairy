@@ -178,8 +178,8 @@
   nil outside a repository. One status call answers both; its entries are
   relative to the checkout, so the paths are compared in that form, and
   the untracked mode is pinned because status.showUntrackedFiles=no would
-  hide the untracked and ignored entries alike. The README's design note
-  on `rules.clean` is the canonical statement of the contract this
+  hide the untracked and ignored entries alike. The `rules.clean` note in
+  `docs/design.md` is the canonical statement of the contract this
   serves."
   [root paths]
   (when-let [status (apply try-git root "status" "--porcelain" "-z" "--ignored"

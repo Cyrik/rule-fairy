@@ -61,7 +61,8 @@ committed: modified, untracked or ignored rules, `rule-fairy.edn`, or an
 instruction file or imported document the bundle used. `rules.clean: null`
 means unknown: the project is outside git, or some of that guidance lies
 outside the checkout, reached through a link or a configured directory.
-The README's design note on `rules.clean` is the canonical statement.
+The `rules.clean` note in the plugin's `docs/design.md` is the canonical
+statement.
 
 ## 4. Review
 

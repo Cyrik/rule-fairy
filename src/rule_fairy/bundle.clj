@@ -262,7 +262,7 @@
   it is modified, untracked or ignored by git (see git/clean?), and nil,
   unknown, outside git and when any of that guidance lies outside the
   checkout, as a configured directory, a link's target or an imported file,
-  where git cannot see it. The README's design note on `rules.clean` is the
+  where git cannot see it. The `rules.clean` note in `docs/design.md` is the
   canonical statement. Keys are the names written to a review's meta.json."
   ([project-root] (rules-revision project-root []))
   ([project-root input-paths]

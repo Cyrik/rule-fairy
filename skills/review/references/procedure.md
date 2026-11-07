@@ -4,7 +4,8 @@ How to check a change against a repository's explicit rules once the inputs
 exist. The `rule-fairy:review` skill prepares them for a diff; the
 `rule-fairy:review-plan` skill prepares them for a plan; a review skill of
 the project itself can prepare them with the same commands and follow this
-procedure for its rules pass (see the README). The reviewer that follows
+procedure for its rules pass (see `docs/review-from-a-skill.md` in the
+plugin). The reviewer that follows
 this procedure reads, compares and reports. It never edits files, changes
 the checkout, commits, or posts anywhere.
 
